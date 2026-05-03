@@ -17,8 +17,9 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-const BRAND_PROMPTS = {
-  default: `你是大衛的 AI 助理。大衛是一個台灣創業家，經營豆漿食品工廠、麵包店、越野吉普車品牌等多個事業。請根據他提供的內容，產出四個品牌的 IG 文章草稿：
+const groupMessages = {};
+
+const BRAND_PROMPTS = `你是大衛的 AI 助理。大衛是一個台灣創業家，經營豆漿食品工廠、麵包店、越野吉普車品牌等多個事業。請根據他提供的內容，產出四個品牌的 IG 文章草稿：
 
 1. 【DF-OFFROAD】越野吉普車品牌 - 風格：賣態度、賣夢想、讓人想加入這個圈子
 2. 【個人品牌 @davidcheng_lifestyle】- 風格：像跟朋友說真心話，真實不裝
@@ -45,55 +46,117 @@ const BRAND_PROMPTS = {
 ---
 📌 聖朝百年慈善
 [內文]
-[hashtag]`
-};
+[hashtag]`;
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
-  
+
   const events = req.body.events;
-  
+
   for (const event of events) {
-    if (event.type !== 'message') continue;
-    
-    let userMessage = '';
-    
-    if (event.message.type === 'text') {
-      userMessage = event.message.text;
-    } else {
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{ type: 'text', text: '請用文字描述你想分享的事情，我來幫你產出 IG 內容！' }]
+    if (event.type !== 'message' || event.message.type !== 'text') continue;
+
+    const text = event.message.text;
+    const sourceType = event.source.type;
+    const userId = event.source.userId;
+
+    if (sourceType === 'group' || sourceType === 'room') {
+      const groupId = event.source.groupId || event.source.roomId;
+      const senderName = userId;
+
+      if (!groupMessages[groupId]) groupMessages[groupId] = [];
+      groupMessages[groupId].push({
+        time: new Date().toLocaleTimeString('zh-TW'),
+        sender: senderName,
+        text: text
       });
-      continue;
-    }
-    
-    try {
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{ type: 'text', text: '⏳ 正在幫你產出四個品牌的 IG 草稿，請稍等...' }]
-      });
-      
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1000,
-        messages: [
-          {
+
+      if (groupMessages[groupId].length > 100) {
+        groupMessages[groupId] = groupMessages[groupId].slice(-100);
+      }
+
+      if (text.includes('@摘要')) {
+        const msgs = groupMessages[groupId];
+        if (msgs.length === 0) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '目前還沒有記錄到任何訊息。' }]
+          });
+          continue;
+        }
+
+        const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
+
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 1000,
+          messages: [{
             role: 'user',
-            content: `${BRAND_PROMPTS.default}\n\n今天的內容：${userMessage}`
-          }
-        ]
-      });
-      
-      const draft = response.content[0].text;
-      
-      await client.pushMessage({
-        to: event.source.userId,
-        messages: [{ type: 'text', text: draft }]
-      });
-      
-    } catch (error) {
-      console.error('Error:', error);
+            content: `請整理以下群組訊息，找出重要事項、待辦事項、需要大衛注意的事情，用繁體中文條列式呈現：\n\n${msgText}`
+          }]
+        });
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }]
+        });
+      }
+
+    } else {
+      if (text.includes('今天摘要') || text.includes('群組摘要')) {
+        if (Object.keys(groupMessages).length === 0) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '目前沒有群組訊息記錄。請先把我加入群組。' }]
+          });
+          continue;
+        }
+
+        let allSummary = '📋 今日群組摘要\n\n';
+        for (const [groupId, msgs] of Object.entries(groupMessages)) {
+          if (msgs.length === 0) continue;
+          const msgText = msgs.map(m => `${m.time}: ${m.text}`).join('\n');
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 500,
+            messages: [{
+              role: 'user',
+              content: `請整理以下訊息的重點，用繁體中文條列式：\n\n${msgText}`
+            }]
+          });
+          allSummary += `群組 ${groupId.slice(-6)}：\n${response.content[0].text}\n\n`;
+        }
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: allSummary }]
+        });
+
+      } else {
+        try {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '⏳ 正在幫你產出四個品牌的 IG 草稿，請稍等...' }]
+          });
+
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 1000,
+            messages: [{
+              role: 'user',
+              content: `${BRAND_PROMPTS}\n\n今天的內容：${text}`
+            }]
+          });
+
+          await client.pushMessage({
+            to: userId,
+            messages: [{ type: 'text', text: response.content[0].text }]
+          });
+
+        } catch (error) {
+          console.error('Error:', error);
+        }
+      }
     }
   }
 });
