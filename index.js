@@ -17,9 +17,11 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+const DAVID_USER_ID = process.env.DAVID_USER_ID || '';
 const groupMessages = {};
 const pendingTasks = [];
-const DAVID_USER_ID = process.env.DAVID_USER_ID || '';
+const contacts = {};
+const waitingForName = {};
 
 const BRAND_PROMPTS = `你是大衛的 AI 助理。大衛是一個台灣創業家，經營豆漿食品工廠、麵包店、越野吉普車品牌等多個事業。請根據他提供的內容，產出四個品牌的 IG 文章草稿：
 
@@ -38,7 +40,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   for (const event of events) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
-    const text = event.message.text;
+    const text = event.message.text.trim();
     const sourceType = event.source.type;
     const userId = event.source.userId;
     const isGroup = sourceType === 'group' || sourceType === 'room';
@@ -49,7 +51,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       if (!groupMessages[groupId]) groupMessages[groupId] = [];
       groupMessages[groupId].push({
         time: new Date().toLocaleTimeString('zh-TW'),
-        sender: userId,
+        sender: contacts[userId] ? contacts[userId].name : userId.slice(-6),
         text: text
       });
       if (groupMessages[groupId].length > 100) {
@@ -57,7 +59,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       }
       if (text.includes('@摘要')) {
         const msgs = groupMessages[groupId];
-        const msgText = msgs.map(m => `${m.time}: ${m.text}`).join('\n');
+        const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
         const response = await anthropic.messages.create({
           model: 'claude-sonnet-4-5',
           max_tokens: 800,
@@ -77,10 +79,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             messages: [{ type: 'text', text: '✅ 今天目前沒有待辦事項。' }]
           });
         } else {
-          const taskList = pendingTasks.map((t, i) => `${i + 1}. ${t.time} — ${t.text}`).join('\n');
+          const taskList = pendingTasks.map((t, i) => {
+            const name = contacts[t.userId] ? contacts[t.userId].name : `陌生人(${t.userId.slice(-6)})`;
+            return `${i + 1}. ${t.time} — ${name}：${t.text}`;
+          }).join('\n');
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `📋 今天待辦事項（${pendingTasks.length}筆）\n\n${taskList}` }]
+            messages: [{ type: 'text', text: `📋 今天待辦（${pendingTasks.length}筆）\n\n${taskList}` }]
           });
         }
       } else if (text === '清空待辦') {
@@ -89,6 +94,19 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: '✅ 待辦清單已清空。' }]
         });
+      } else if (text === '聯絡人清單') {
+        if (Object.keys(contacts).length === 0) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '目前還沒有聯絡人記錄。' }]
+          });
+        } else {
+          const list = Object.values(contacts).map(c => `${c.name}（${c.relation}）`).join('\n');
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `📒 聯絡人清單\n\n${list}` }]
+          });
+        }
       } else if (text.startsWith('秘書：') || text.startsWith('秘書:')) {
         const content = text.replace(/^秘書[：:]/, '');
         const response = await anthropic.messages.create({
@@ -129,20 +147,49 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       }
 
     } else {
-      pendingTasks.push({
-        time: new Date().toLocaleTimeString('zh-TW'),
-        userId: userId,
-        text: text
-      });
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{ type: 'text', text: '您好！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！' }]
-      });
-      if (DAVID_USER_ID) {
-        await client.pushMessage({
-          to: DAVID_USER_ID,
-          messages: [{ type: 'text', text: `📨 有新訊息！\n\n內容：${text}\n\n傳「今天待辦」查看所有訊息。` }]
+      if (waitingForName[userId]) {
+        const parts = text.split(/[,，、\s]+/);
+        const name = parts[0] || text;
+        const relation = parts[1] || '未知';
+        contacts[userId] = { name, relation };
+        delete waitingForName[userId];
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `謝謝您，${name}！我已幫您登記，大衛會盡快回覆您。` }]
         });
+
+        if (DAVID_USER_ID) {
+          await client.pushMessage({
+            to: DAVID_USER_ID,
+            messages: [{ type: 'text', text: `📨 新聯絡人登記！\n\n姓名：${name}\n關係：${relation}\n\n傳「今天待辦」查看所有訊息。` }]
+          });
+        }
+
+      } else if (!contacts[userId]) {
+        waitingForName[userId] = true;
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `您好！我是大衛的 AI 助理 🤖\n\n請問您的姓名是？以及您跟大衛是什麼關係？\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }]
+        });
+
+      } else {
+        const name = contacts[userId].name;
+        pendingTasks.push({
+          time: new Date().toLocaleTimeString('zh-TW'),
+          userId,
+          text
+        });
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！` }]
+        });
+        if (DAVID_USER_ID) {
+          await client.pushMessage({
+            to: DAVID_USER_ID,
+            messages: [{ type: 'text', text: `📨 有新訊息！\n\n${name}說：${text}\n\n傳「今天待辦」查看所有訊息。` }]
+          });
+        }
       }
     }
   }
