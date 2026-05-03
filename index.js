@@ -18,6 +18,8 @@ const anthropic = new Anthropic({
 });
 
 const groupMessages = {};
+const pendingTasks = [];
+const DAVID_USER_ID = process.env.DAVID_USER_ID || '';
 
 const BRAND_PROMPTS = `你是大衛的 AI 助理。大衛是一個台灣創業家，經營豆漿食品工廠、麵包店、越野吉普車品牌等多個事業。請根據他提供的內容，產出四個品牌的 IG 文章草稿：
 
@@ -26,27 +28,7 @@ const BRAND_PROMPTS = `你是大衛的 AI 助理。大衛是一個台灣創業�
 3. 【VBVieBelle 麵包】- 風格：看了就想吃，注重健康生活品質
 4. 【聖朝百年慈善】- 風格：召集同伴，一起把好事傳承下去
 
-請為每個品牌各產出一篇 IG 文章草稿，包含內文和 3-5 個 hashtag。格式如下：
-
----
-📌 DF-OFFROAD
-[內文]
-[hashtag]
-
----
-📌 個人品牌
-[內文]
-[hashtag]
-
----
-📌 VBVieBelle
-[內文]
-[hashtag]
-
----
-📌 聖朝百年慈善
-[內文]
-[hashtag]`;
+請為每個品牌各產出一篇 IG 文章草稿，包含內文和 3-5 個 hashtag。`;
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
@@ -59,103 +41,108 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const text = event.message.text;
     const sourceType = event.source.type;
     const userId = event.source.userId;
+    const isGroup = sourceType === 'group' || sourceType === 'room';
+    const isDavid = userId === DAVID_USER_ID;
 
-    if (sourceType === 'group' || sourceType === 'room') {
+    if (isGroup) {
       const groupId = event.source.groupId || event.source.roomId;
-      const senderName = userId;
-
       if (!groupMessages[groupId]) groupMessages[groupId] = [];
       groupMessages[groupId].push({
         time: new Date().toLocaleTimeString('zh-TW'),
-        sender: senderName,
+        sender: userId,
         text: text
       });
-
       if (groupMessages[groupId].length > 100) {
         groupMessages[groupId] = groupMessages[groupId].slice(-100);
       }
-
       if (text.includes('@摘要')) {
         const msgs = groupMessages[groupId];
-        if (msgs.length === 0) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '目前還沒有記錄到任何訊息。' }]
-          });
-          continue;
-        }
-
-        const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
-
+        const msgText = msgs.map(m => `${m.time}: ${m.text}`).join('\n');
         const response = await anthropic.messages.create({
           model: 'claude-sonnet-4-5',
-          max_tokens: 1000,
-          messages: [{
-            role: 'user',
-            content: `請整理以下群組訊息，找出重要事項、待辦事項、需要大衛注意的事情，用繁體中文條列式呈現：\n\n${msgText}`
-          }]
+          max_tokens: 800,
+          messages: [{ role: 'user', content: `請整理以下群組訊息的重點，條列式：\n\n${msgText}` }]
         });
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }]
         });
       }
 
-    } else {
-      if (text.includes('今天摘要') || text.includes('群組摘要')) {
-        if (Object.keys(groupMessages).length === 0) {
+    } else if (isDavid) {
+      if (text === '今天待辦' || text === '待辦清單') {
+        if (pendingTasks.length === 0) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '目前沒有群組訊息記錄。請先把我加入群組。' }]
+            messages: [{ type: 'text', text: '✅ 今天目前沒有待辦事項。' }]
           });
-          continue;
-        }
-
-        let allSummary = '📋 今日群組摘要\n\n';
-        for (const [groupId, msgs] of Object.entries(groupMessages)) {
-          if (msgs.length === 0) continue;
-          const msgText = msgs.map(m => `${m.time}: ${m.text}`).join('\n');
-          const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5',
-            max_tokens: 500,
-            messages: [{
-              role: 'user',
-              content: `請整理以下訊息的重點，用繁體中文條列式：\n\n${msgText}`
-            }]
+        } else {
+          const taskList = pendingTasks.map((t, i) => `${i + 1}. ${t.time} — ${t.text}`).join('\n');
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `📋 今天待辦事項（${pendingTasks.length}筆）\n\n${taskList}` }]
           });
-          allSummary += `群組 ${groupId.slice(-6)}：\n${response.content[0].text}\n\n`;
         }
-
+      } else if (text === '清空待辦') {
+        pendingTasks.length = 0;
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: allSummary }]
+          messages: [{ type: 'text', text: '✅ 待辦清單已清空。' }]
         });
+      } else if (text.startsWith('秘書：') || text.startsWith('秘書:')) {
+        const content = text.replace(/^秘書[：:]/, '');
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 800,
+          messages: [{
+            role: 'user',
+            content: `你是大衛的秘書，請分析以下訊息並提供：
+1. 緊急程度（🔴馬上處理 / 🟡今天內 / 🟢可以等）
+2. 建議回覆文字
+3. 注意事項
 
+訊息內容：${content}`
+          }]
+        });
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: response.content[0].text }]
+        });
       } else {
         try {
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: '⏳ 正在幫你產出四個品牌的 IG 草稿，請稍等...' }]
           });
-
           const response = await anthropic.messages.create({
             model: 'claude-sonnet-4-5',
             max_tokens: 1000,
-            messages: [{
-              role: 'user',
-              content: `${BRAND_PROMPTS}\n\n今天的內容：${text}`
-            }]
+            messages: [{ role: 'user', content: `${BRAND_PROMPTS}\n\n今天的內容：${text}` }]
           });
-
           await client.pushMessage({
             to: userId,
             messages: [{ type: 'text', text: response.content[0].text }]
           });
-
         } catch (error) {
           console.error('Error:', error);
         }
+      }
+
+    } else {
+      pendingTasks.push({
+        time: new Date().toLocaleTimeString('zh-TW'),
+        userId: userId,
+        text: text
+      });
+      await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '您好！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！' }]
+      });
+      if (DAVID_USER_ID) {
+        await client.pushMessage({
+          to: DAVID_USER_ID,
+          messages: [{ type: 'text', text: `📨 有新訊息！\n\n內容：${text}\n\n傳「今天待辦」查看所有訊息。` }]
+        });
       }
     }
   }
