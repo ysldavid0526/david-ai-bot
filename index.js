@@ -77,6 +77,34 @@ async function saveContact(userId, name, relation) {
   }
 }
 
+// 更新備註
+async function updateNote(userId, note) {
+  try {
+    const sheets = getSheetClient();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: '工作表1!A2:E1000',
+    });
+    const rows = res.data.values || [];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][0] === userId) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `工作表1!D${i + 2}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[note]] },
+        });
+        console.log(`✅ 已更新備註：${note}`);
+        return true;
+      }
+    }
+    return false;
+  } catch (e) {
+    console.error('更新備註失敗:', e.message);
+    return false;
+  }
+}
+
 // ===== 下載圖片為 base64 =====
 async function downloadImageAsBase64(messageId) {
   return new Promise((resolve, reject) => {
@@ -219,11 +247,83 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             messages: [{ type: 'text', text: '目前還沒有聯絡人記錄。' }],
           });
         } else {
-          const list = Object.values(contacts).map(c => `${c.name}（${c.relation}）`).join('\n');
+          const list = Object.values(contacts).map(c => `${c.name}（${c.relation}）${c.note ? ' — ' + c.note : ''}`).join('\n');
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: `📒 聯絡人清單\n\n${list}` }],
           });
+        }
+
+      } else if (text.startsWith('查 ')) {
+        const searchName = text.replace(/^查 /, '').trim();
+        const found = Object.entries(contacts).find(([, c]) => c.name.includes(searchName));
+        if (!found) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」的聯絡人資料。` }],
+          });
+        } else {
+          const [, c] = found;
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `👤 ${c.name}\n關係：${c.relation}\n備註：${c.note || '無'}\n加入時間：${c.joinTime}` }],
+          });
+        }
+
+      } else if (text.startsWith('備註 ')) {
+        const parts = text.replace(/^備註 /, '').trim().split(/\s+/);
+        const searchName = parts[0];
+        const note = parts.slice(1).join(' ');
+        const found = Object.entries(contacts).find(([, c]) => c.name.includes(searchName));
+        if (!found) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」，請確認姓名。` }],
+          });
+        } else {
+          const [foundUserId, c] = found;
+          contacts[foundUserId].note = note;
+          await updateNote(foundUserId, note);
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `✅ 已更新 ${c.name} 的備註：${note}` }],
+          });
+        }
+
+      } else if (text.startsWith('回覆 ')) {
+        const input = text.replace(/^回覆 /, '').trim();
+        const spaceIdx = input.indexOf(' ');
+        const searchName = spaceIdx > -1 ? input.slice(0, spaceIdx) : input;
+        const instruction = spaceIdx > -1 ? input.slice(spaceIdx + 1) : '';
+        const found = Object.entries(contacts).find(([, c]) => c.name.includes(searchName));
+
+        if (!found) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」，請確認姓名。` }],
+          });
+        } else {
+          const [, c] = found;
+          try {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: '⏳ 正在幫你草擬回覆，請稍等...' }],
+            });
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 600,
+              messages: [{
+                role: 'user',
+                content: `你是大衛的秘書。大衛要回覆給 ${c.name}（關係：${c.relation}${c.note ? `，備註：${c.note}` : ''}）。\n\n回覆內容：${instruction}\n\n請幫大衛寫一段自然、得體的回覆訊息，口吻像大衛本人，不要太正式。`
+              }],
+            });
+            await client.pushMessage({
+              to: userId,
+              messages: [{ type: 'text', text: `📝 給 ${c.name} 的回覆草稿：\n\n${response.content[0].text}` }],
+            });
+          } catch (error) {
+            console.error('Error:', error);
+          }
         }
 
       } else if (text.startsWith('秘書：') || text.startsWith('秘書:')) {
@@ -331,7 +431,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n🗂 聯絡人\n聯絡人清單\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
