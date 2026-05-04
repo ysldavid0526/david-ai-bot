@@ -104,7 +104,8 @@ const groupMessages = {};
 const pendingTasks = [];
 const waitingForName = {};
 let contacts = {};
-const pendingImages = {}; // 暫存圖片
+const pendingImages = {};
+const lastDraft = {};
 
 loadContacts().then(data => { contacts = data; });
 
@@ -149,7 +150,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       };
       await client.replyMessage({
         replyToken: event.replyToken,
-        messages: [{ type: 'text', text: '📸 圖片收到！請傳指令，例如：\n寫文案 df\n寫文案 viebelle\n寫文案 聖朝\n寫文案 david\n寫文案 全部' }],
+        messages: [{ type: 'text', text: '📸 圖片收到！請傳指令，例如：\n寫文案 df 幫我賣這個產品\n寫文案 viebelle\n寫文案 聖朝\n寫文案 david\n寫文案 全部' }],
       });
       continue;
     }
@@ -252,7 +253,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const brandKey = BRAND_MAP[brandRaw] || 'all';
         const prompt = BRAND_PROMPTS[brandKey];
 
-        // 檢查有沒有暫存圖片（5分鐘內有效）
         const imgData = pendingImages[userId];
         const hasImage = imgData && (Date.now() - imgData.time < 5 * 60 * 1000);
 
@@ -264,7 +264,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           let messages;
           if (hasImage) {
-            // 下載圖片
             const base64Image = await downloadImageAsBase64(imgData.messageId);
             delete pendingImages[userId];
             messages = [{
@@ -286,6 +285,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             max_tokens: 1000,
             messages,
           });
+
+          lastDraft[userId] = response.content[0].text;
+
           await client.pushMessage({
             to: userId,
             messages: [{ type: 'text', text: response.content[0].text }],
@@ -294,16 +296,48 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           console.error('Error:', error);
         }
 
+      } else if (text.startsWith('修改')) {
+        const instruction = text.replace(/^修改[： ]?/, '').trim();
+        const previous = lastDraft[userId];
+        if (!previous) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '❌ 還沒有暫存文案，請先用「寫文案」產出內容。' }],
+          });
+        } else {
+          try {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: '⏳ 正在修改文案，請稍等...' }],
+            });
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 1000,
+              messages: [{
+                role: 'user',
+                content: `以下是原本的 IG 文案：\n\n${previous}\n\n請根據以下要求修改：${instruction || '整體優化'}\n\n請直接給我修改後的完整文案。`
+              }],
+            });
+            lastDraft[userId] = response.content[0].text;
+            await client.pushMessage({
+              to: userId,
+              messages: [{ type: 'text', text: response.content[0].text }],
+            });
+          } catch (error) {
+            console.error('Error:', error);
+          }
+        }
+
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n🗂 聯絡人\n聯絡人清單\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n🗂 聯絡人\n聯絡人清單\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `收到！請用指令操作：\n\n寫文案 df [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 david [內容]\n寫文案 全部 [內容]\n\n或傳「指令」查看完整清單。` }],
+          messages: [{ type: 'text', text: `收到！請用指令操作，傳「指令」查看完整清單。` }],
         });
       }
 
