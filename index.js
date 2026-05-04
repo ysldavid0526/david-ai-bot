@@ -10,11 +10,8 @@ const app = express();
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   next();
 });
-
-app.use(express.json());
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -143,11 +140,9 @@ function parseEventTime(timeStr) {
   } else if (timeStr.includes('下週一')) {
     date.setDate(date.getDate() + (8 - date.getDay()) % 7 || 7);
   } else if (timeStr.includes('下週三')) {
-    const d = (10 - date.getDay()) % 7 || 7;
-    date.setDate(date.getDate() + d);
+    date.setDate(date.getDate() + (10 - date.getDay()) % 7 || 7);
   } else if (timeStr.includes('下週五')) {
-    const d = (12 - date.getDay()) % 7 || 7;
-    date.setDate(date.getDate() + d);
+    date.setDate(date.getDate() + (12 - date.getDay()) % 7 || 7);
   }
 
   const timeMatch = timeStr.match(/(上午|下午|早上|晚上)?(\d{1,2})[點:時](\d{0,2})?/);
@@ -287,9 +282,30 @@ const BRAND_MAP = {
 };
 
 // ===== API 路由 =====
-app.get('/', (req, res) => res.send('David AI Bot is running! 🚀'));
 
-app.get('/app', (req, res) => res.sendFile(path.join(__dirname, 'app.html')));
+// App — 從 GitHub 自動讀取最新版本
+app.get('/app', async (req, res) => {
+  try {
+    const url = 'https://raw.githubusercontent.com/ysldavid0526/david-ai-bot/main/app.html';
+    https.get(url, (response) => {
+      let data = '';
+      response.on('data', chunk => data += chunk);
+      response.on('end', () => {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(data);
+      });
+    }).on('error', () => {
+      res.sendFile(path.join(__dirname, 'app.html'));
+    });
+  } catch (e) {
+    res.sendFile(path.join(__dirname, 'app.html'));
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send('David AI Bot is running! 🚀');
+});
 
 app.get('/api/news', async (req, res) => {
   try {
@@ -338,25 +354,18 @@ app.get('/api/todos', (req, res) => {
   res.json({ todos });
 });
 
-// 新增行程 API（App 直接呼叫）
-app.post('/api/add-event', async (req, res) => {
+// 新增行程 API
+app.post('/api/add-event', express.json(), async (req, res) => {
   try {
     const { title, timeStr } = req.body;
-    if (!title || !timeStr) return res.status(400).json({ error: '缺少參數' });
     const result = await addCalendarEvent(title, timeStr);
     if (result.success) {
-      const { date, hasTime } = parseEventTime(timeStr);
-      const timeDisplay = hasTime
-        ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-        : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-      // 通知大衛 LINE
-      if (DAVID_USER_ID) {
-        await client.pushMessage({
-          to: DAVID_USER_ID,
-          messages: [{ type: 'text', text: `✅ App 新增行程！\n\n📅 ${timeDisplay}\n📌 ${title}` }],
-        });
-      }
-      appNotifications.unshift({ type: 'calendar', icon: '📅', app: 'App 行事曆', text: `新增：${title}（${timeDisplay}）`, time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), timestamp: Date.now() });
+      appNotifications.unshift({
+        type: 'calendar', icon: '📅', app: '行事曆',
+        text: `已新增行程：${title}`,
+        time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+        timestamp: Date.now()
+      });
       if (appNotifications.length > 50) appNotifications.pop();
     }
     res.json({ success: result.success });
@@ -365,18 +374,14 @@ app.post('/api/add-event', async (req, res) => {
   }
 });
 
-// 傳訊息 API（App 直接呼叫）
-app.post('/api/send-message', async (req, res) => {
+// 傳訊息 API
+app.post('/api/send-message', express.json(), async (req, res) => {
   try {
     const { targetUserId, message } = req.body;
-    if (!targetUserId || !message) return res.status(400).json({ error: '缺少參數' });
     await client.pushMessage({
       to: targetUserId,
       messages: [{ type: 'text', text: message }],
     });
-    const targetName = contacts[targetUserId] ? contacts[targetUserId].name : targetUserId.slice(-6);
-    appNotifications.unshift({ type: 'sent', icon: '📤', app: 'App 訊息', text: `已傳送給 ${targetName}：${message.slice(0, 30)}`, time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), timestamp: Date.now() });
-    if (appNotifications.length > 50) appNotifications.pop();
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -423,8 +428,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const nameMatch = text.match(/登記\s*(.+)/);
         const groupName = nameMatch ? nameMatch[1].trim() : '未命名群組';
         groupNames[groupId] = groupName;
-        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」` }] });
-
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」` }],
+        });
       } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
         const today2 = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
@@ -436,8 +443,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           max_tokens: 800,
           messages: [{ role: 'user', content: `請整理以下群組訊息的重點，條列式，並標示有哪些事情需要大衛處理：\n\n${msgText}` }],
         });
-        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }] });
-
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
+        });
       } else if (text.includes('取消') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -460,8 +469,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已通知大衛！等待確認中...` }] });
-
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已通知大衛！等待確認中...` }],
+        });
       } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -480,7 +491,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已轉達給大衛！` }] });
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已轉達給大衛！` }],
+        });
       }
 
     } else if (isDavid) {
@@ -828,6 +842,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       }
 
     } else {
+
+      const senderName = contacts[userId] ? contacts[userId].name : null;
 
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
         const timeStr = extractTimeStr(text);
