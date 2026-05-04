@@ -2,6 +2,7 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
+const https = require('https');
 
 const app = express();
 
@@ -76,11 +77,34 @@ async function saveContact(userId, name, relation) {
   }
 }
 
+// ===== 下載圖片為 base64 =====
+async function downloadImageAsBase64(messageId) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api-data.line.me',
+      path: `/v2/bot/message/${messageId}/content`,
+      headers: {
+        Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      },
+    };
+    https.get(options, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer.toString('base64'));
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
 // ===== 記憶體資料 =====
 const groupMessages = {};
 const pendingTasks = [];
 const waitingForName = {};
 let contacts = {};
+const pendingImages = {}; // 暫存圖片
 
 loadContacts().then(data => { contacts = data; });
 
@@ -112,13 +136,27 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   const events = req.body.events;
 
   for (const event of events) {
-    if (event.type !== 'message' || event.message.type !== 'text') continue;
-
-    const text = event.message.text.trim();
     const sourceType = event.source.type;
     const userId = event.source.userId;
     const isGroup = sourceType === 'group' || sourceType === 'room';
     const isDavid = userId === DAVID_USER_ID;
+
+    // ===== 處理圖片訊息 =====
+    if (event.type === 'message' && event.message.type === 'image' && isDavid) {
+      pendingImages[userId] = {
+        messageId: event.message.id,
+        time: Date.now(),
+      };
+      await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '📸 圖片收到！請傳指令，例如：\n寫文案 df\n寫文案 viebelle\n寫文案 聖朝\n寫文案 david\n寫文案 全部' }],
+      });
+      continue;
+    }
+
+    if (event.type !== 'message' || event.message.type !== 'text') continue;
+
+    const text = event.message.text.trim();
 
     // ===== 群組模式 =====
     if (isGroup) {
@@ -206,23 +244,47 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: response.content[0].text }],
         });
 
-      } else if (text.startsWith('寫文案') || text.startsWith('寫文案：')) {
+      } else if (text.startsWith('寫文案')) {
         const input = text.replace(/^寫文案[： ]?/, '').trim();
         const parts = input.split(/\s+/);
         const brandRaw = parts[0].toLowerCase();
-        const content = parts.slice(1).join(' ');
+        const extraContent = parts.slice(1).join(' ');
         const brandKey = BRAND_MAP[brandRaw] || 'all';
         const prompt = BRAND_PROMPTS[brandKey];
+
+        // 檢查有沒有暫存圖片（5分鐘內有效）
+        const imgData = pendingImages[userId];
+        const hasImage = imgData && (Date.now() - imgData.time < 5 * 60 * 1000);
 
         try {
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: '⏳ 正在幫你產出 IG 草稿，請稍等...' }],
           });
+
+          let messages;
+          if (hasImage) {
+            // 下載圖片
+            const base64Image = await downloadImageAsBase64(imgData.messageId);
+            delete pendingImages[userId];
+            messages = [{
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+                { type: 'text', text: `${prompt}\n\n請根據這張照片${extraContent ? `和以下補充內容：${extraContent}` : ''}，產出 IG 文案。` }
+              ]
+            }];
+          } else {
+            messages = [{
+              role: 'user',
+              content: `${prompt}\n\n今天的內容：${extraContent || input}`
+            }];
+          }
+
           const response = await anthropic.messages.create({
             model: 'claude-sonnet-4-5',
             max_tokens: 1000,
-            messages: [{ role: 'user', content: `${prompt}\n\n今天的內容：${content || input}` }],
+            messages,
           });
           await client.pushMessage({
             to: userId,
@@ -235,7 +297,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n🗂 聯絡人\n聯絡人清單\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n🗂 聯絡人\n聯絡人清單\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
