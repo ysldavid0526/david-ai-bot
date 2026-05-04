@@ -295,7 +295,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         text,
       });
       if (groupMessages[groupId].length > 100) groupMessages[groupId] = groupMessages[groupId].slice(-100);
-      if (text.includes('@摘要')) {
+
+      if (text.includes('@David摘要') || text.includes('@摘要')) {
         const msgs = groupMessages[groupId];
         const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
         const response = await anthropic.messages.create({
@@ -307,12 +308,121 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
         });
+
+      } else if (text.includes('@David取消')) {
+        const content = text.replace(/@David取消\s*/, '').trim();
+        const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
+        const reasonMatch = content.match(/原因[：:]\s*(.+)/);
+        const reason = reasonMatch ? reasonMatch[1].trim() : '未說明';
+        const eventInfo = content.replace(/原因[：:].+/, '').trim();
+        const cancelId = Date.now().toString();
+
+        await client.pushMessage({
+          to: DAVID_USER_ID,
+          messages: [{
+            type: 'text',
+            text: `🚨 取消申請！\n\n👤 ${senderName} 申請取消行程\n📌 ${eventInfo}\n💬 原因：${reason}\n\n請確認是否取消？`,
+            quickReply: {
+              items: [
+                { type: 'action', action: { type: 'message', label: '✅ 確認取消', text: `群組確認取消_${cancelId}_${eventInfo}_${groupId}_${userId}` } },
+                { type: 'action', action: { type: 'message', label: '❌ 不取消', text: `群組拒絕取消_${cancelId}_${groupId}_${userId}_${senderName}` } },
+              ],
+            },
+          }],
+        });
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
+        });
+
+      } else if (text.includes('@David留言')) {
+        const content = text.replace(/@David留言\s*/, '').trim();
+        const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
+
+        await client.pushMessage({
+          to: DAVID_USER_ID,
+          messages: [{
+            type: 'text',
+            text: `💬 群組留言！\n\n👤 ${senderName} 在群組留言：\n\n${content}`,
+            quickReply: {
+              items: [
+                { type: 'action', action: { type: 'message', label: '↩️ 回覆他', text: `回覆 ${senderName} ` } },
+                { type: 'action', action: { type: 'message', label: '👍 已讀', text: '已讀留言' } },
+              ],
+            },
+          }],
+        });
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已轉達給大衛！他會盡快回覆。` }],
+        });
       }
 
     // ===== 大衛模式 =====
     } else if (isDavid) {
 
-      if (text.startsWith('確認預約_') || text.startsWith('拒絕預約_')) {
+      // 群組取消確認
+      if (text.startsWith('群組確認取消_')) {
+        const parts = text.split('_');
+        const eventInfo = parts[2];
+        const groupId = parts[3];
+
+        try {
+          const calendar = getCalendarClient();
+          const taipei = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+          taipei.setHours(0, 0, 0, 0);
+          const endDate = new Date(taipei);
+          endDate.setDate(endDate.getDate() + 30);
+          const res = await calendar.events.list({
+            calendarId: CALENDAR_ID,
+            timeMin: taipei.toISOString(),
+            timeMax: endDate.toISOString(),
+            singleEvents: true,
+            orderBy: 'startTime',
+            q: eventInfo,
+          });
+          const evts = res.data.items || [];
+          if (evts.length > 0) {
+            await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
+          }
+        } catch (e) {
+          console.error('刪除行程失敗:', e.message);
+        }
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已確認取消！行事曆已更新。` }],
+        });
+
+        await client.pushMessage({
+          to: groupId,
+          messages: [{ type: 'text', text: `✅ 大衛已確認取消：${eventInfo}` }],
+        });
+
+      } else if (text.startsWith('群組拒絕取消_')) {
+        const parts = text.split('_');
+        const groupId = parts[2];
+        const senderName = parts[4];
+
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已拒絕取消申請。` }],
+        });
+
+        await client.pushMessage({
+          to: groupId,
+          messages: [{ type: 'text', text: `❌ 大衛確認保留此行程，${senderName} 的取消申請不通過。` }],
+        });
+
+      } else if (text === '已讀留言') {
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已讀取。` }],
+        });
+
+      } else if (text.startsWith('確認預約_') || text.startsWith('拒絕預約_')) {
         const bookingId = text.split('_')[1];
         const booking = waitingBookingConfirm[bookingId];
         if (!booking) {
@@ -631,7 +741,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n👥 群組指令\n@David摘要\n@David取消 行程 原因：OOO\n@David留言 內容` }],
         });
 
       } else {
