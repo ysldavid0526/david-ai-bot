@@ -110,6 +110,16 @@ async function updateNote(userId, note) {
   }
 }
 
+// ===== 時間解析（只抓時間部分）=====
+function extractTimeStr(input) {
+  const match = input.match(/(今天|明天|後天|下週[一二三四五六日]|這週[一二三四五六日]|\d+月\d+日?)?[\s]*(上午|下午|早上|晚上)?[\s]*(\d{1,2})[點:時](\d{0,2})?/);
+  if (match) return match[0].trim();
+  if (input.includes('今天') || input.includes('明天') || input.includes('後天')) {
+    return input.match(/(今天|明天|後天)/)[0];
+  }
+  return input;
+}
+
 function parseEventTime(timeStr) {
   const now = new Date();
   const taipei = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
@@ -156,10 +166,7 @@ async function addCalendarEvent(title, timeStr, duration = 60) {
         end: { date: dateStr },
       };
     }
-    const res = await calendar.events.insert({
-      calendarId: CALENDAR_ID,
-      requestBody: event,
-    });
+    const res = await calendar.events.insert({ calendarId: CALENDAR_ID, requestBody: event });
     return { success: true, event: res.data };
   } catch (e) {
     console.error('新增行程失敗:', e.message);
@@ -224,7 +231,6 @@ async function downloadImageAsBase64(messageId) {
   });
 }
 
-// ===== 記憶體資料 =====
 const groupMessages = {};
 const pendingTasks = [];
 const waitingForName = {};
@@ -232,7 +238,7 @@ let contacts = {};
 const pendingImages = {};
 const lastDraft = {};
 const pendingReply = {};
-const pendingBooking = {}; // 步驟：waiting_time / waiting_title
+const pendingBooking = {};
 const waitingBookingConfirm = {};
 
 loadContacts().then(data => { contacts = data; });
@@ -280,6 +286,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
     const text = event.message.text.trim();
 
+    // ===== 群組模式 =====
     if (isGroup) {
       const groupId = event.source.groupId || event.source.roomId;
       if (!groupMessages[groupId]) groupMessages[groupId] = [];
@@ -303,6 +310,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         });
       }
 
+    // ===== 大衛模式 =====
     } else if (isDavid) {
 
       if (text.startsWith('確認預約_') || text.startsWith('拒絕預約_')) {
@@ -362,6 +370,57 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: `❌ 新增失敗，請再試一次。` }],
+          });
+        }
+
+      } else if (text.startsWith('取消行程 ') || text.startsWith('取消行程：')) {
+        const keyword = text.replace(/^取消行程[： ]/, '').trim();
+        try {
+          const calendar = getCalendarClient();
+          const taipei = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+          taipei.setHours(0, 0, 0, 0);
+          const endDate = new Date(taipei);
+          endDate.setDate(endDate.getDate() + 30);
+          const res = await calendar.events.list({
+            calendarId: CALENDAR_ID,
+            timeMin: taipei.toISOString(),
+            timeMax: endDate.toISOString(),
+            singleEvents: true,
+            orderBy: 'startTime',
+            q: keyword,
+          });
+          const evts = res.data.items || [];
+          if (evts.length === 0) {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `❌ 找不到「${keyword}」相關行程。` }],
+            });
+          } else if (evts.length === 1) {
+            await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
+            const start = evts[0].start.dateTime
+              ? new Date(evts[0].start.dateTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+              : evts[0].start.date;
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `✅ 已取消行程：\n\n📅 ${start}\n📌 ${evts[0].summary}` }],
+            });
+          } else {
+            const list = evts.slice(0, 5).map((e, i) => {
+              const start = e.start.dateTime
+                ? new Date(e.start.dateTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                : e.start.date;
+              return `${i + 1}. ${start} ${e.summary}`;
+            }).join('\n');
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `找到多筆行程，請輸入更精確的關鍵字：\n\n${list}` }],
+            });
+          }
+        } catch (error) {
+          console.error('取消行程失敗:', error);
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 取消失敗，請再試一次。` }],
           });
         }
 
@@ -443,7 +502,20 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             });
             const draft = response.content[0].text;
             pendingReply[userId] = { targetUserId, targetName: c.name, draft };
-            await client.pushMessage({ to: userId, messages: [{ type: 'text', text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}\n\n---\n傳「確認傳送」送出，或傳「取消」放棄。` }] });
+            // 用 Quick Reply 按鈕
+            await client.pushMessage({
+              to: userId,
+              messages: [{
+                type: 'text',
+                text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}`,
+                quickReply: {
+                  items: [
+                    { type: 'action', action: { type: 'message', label: '✅ 確認傳送', text: '確認傳送' } },
+                    { type: 'action', action: { type: 'message', label: '❌ 取消', text: '取消' } },
+                  ],
+                },
+              }],
+            });
           } catch (error) { console.error('Error:', error); }
         }
 
@@ -526,25 +598,26 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n今天行程\n明天行程\n本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n確認傳送 / 取消\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
         await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `收到！請用指令操作，傳「指令」查看完整清單。` }] });
       }
 
+    // ===== 陌生人模式 =====
     } else {
 
-      // ===== 預約流程：步驟一 - 等待時間 =====
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
-        pendingBooking[userId].timeStr = text;
+        // 只抓時間部分
+        const timeStr = extractTimeStr(text);
+        pendingBooking[userId].timeStr = timeStr;
         pendingBooking[userId].step = 'waiting_title';
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `收到時間：${text} ✅\n\n請問這次預約的事由是？\n例如：產品洽談、工廠參觀、合作討論` }],
+          messages: [{ type: 'text', text: `收到時間：${timeStr} ✅\n\n請問這次預約的事由是？\n例如：產品洽談、工廠參觀、合作討論` }],
         });
 
-      // ===== 預約流程：步驟二 - 等待事由 =====
       } else if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_title') {
         const booking = pendingBooking[userId];
         const title = text;
@@ -552,11 +625,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
         const bookingId = Date.now().toString();
         waitingBookingConfirm[bookingId] = {
-          userId,
-          name: booking.name,
-          relation: booking.relation,
-          timeStr: booking.timeStr,
-          title,
+          userId, name: booking.name, relation: booking.relation,
+          timeStr: booking.timeStr, title,
         };
 
         const { date, hasTime } = parseEventTime(booking.timeStr);
@@ -564,7 +634,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
 
-        // 通知大衛
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
