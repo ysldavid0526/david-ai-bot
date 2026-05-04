@@ -3,6 +3,7 @@ const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
 const https = require('https');
+const path = require('path');
 
 const app = express();
 
@@ -273,7 +274,15 @@ const BRAND_MAP = {
   '全部': 'all', 'all': 'all'
 };
 
-// ===== 新聞 API =====
+// ===== API 路由 =====
+app.get('/', (req, res) => {
+  res.send('David AI Bot is running! 🚀');
+});
+
+app.get('/app', (req, res) => {
+  res.sendFile(path.join(__dirname, 'app.html'));
+});
+
 app.get('/api/news', async (req, res) => {
   try {
     const query = encodeURIComponent('台灣 財經 國際 科技 商業 經濟');
@@ -291,7 +300,6 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
-// ===== 行事曆 API =====
 app.get('/api/calendar', async (req, res) => {
   try {
     const events = await getCalendarEvents('今天');
@@ -324,11 +332,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
     const text = event.message.text.trim();
 
-    // ===== 群組模式 =====
     if (isGroup) {
       const groupId = event.source.groupId || event.source.roomId;
       if (!groupMessages[groupId]) groupMessages[groupId] = [];
-
       const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
       groupMessages[groupId].push({
         time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }),
@@ -346,7 +352,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」\n\n大衛現在可以用「群組摘要 ${groupName}」查詢這個群組！` }],
         });
-
       } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
         const today2 = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
@@ -362,7 +367,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
         });
-
       } else if (text.includes('取消') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -370,7 +374,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const reason = reasonMatch ? reasonMatch[1].trim() : '未說明';
         const eventInfo = content.replace(/原因[：:].+/, '').trim();
         const cancelId = Date.now().toString();
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -384,16 +387,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
         });
-
       } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -407,20 +407,17 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已轉達給大衛！他會盡快回覆。` }],
         });
       }
 
-    // ===== 大衛模式 =====
     } else if (isDavid) {
 
       if (text.startsWith('群組摘要 ') || text.startsWith('群組摘要：')) {
         const groupNameQuery = text.replace(/^群組摘要[： ]/, '').trim();
         const foundGroupId = Object.entries(groupNames).find(([, name]) => name.includes(groupNameQuery))?.[0];
-
         if (!foundGroupId) {
           const groupList = Object.values(groupNames).join('、');
           await client.replyMessage({
@@ -443,10 +440,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 1000,
-              messages: [{
-                role: 'user',
-                content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：\n\n1. 今天發生了什麼事（重點摘要）\n2. 有哪些事情需要大衛處理或決策\n3. 有沒有重要通知或決定\n\n訊息記錄：\n${msgText}`
-              }],
+              messages: [{ role: 'user', content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：\n\n1. 今天發生了什麼事（重點摘要）\n2. 有哪些事情需要大衛處理或決策\n3. 有沒有重要通知或決定\n\n訊息記錄：\n${msgText}` }],
             });
             await client.replyMessage({
               replyToken: event.replyToken,
@@ -490,7 +484,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           const evts = res.data.items || [];
           if (evts.length > 0) await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
         } catch (e) { console.error('刪除行程失敗:', e.message); }
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已確認取消！行事曆已更新。` }],
@@ -834,14 +827,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要\n取消 行程 原因：OOO\n留言 內容` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要\n取消 行程 原因：OOO\n留言 內容\n\n📱 App\nhttps://david-ai-bot.onrender.com/app` }],
         });
 
       } else {
         await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `收到！請用指令操作，傳「指令」查看完整清單。` }] });
       }
 
-    // ===== 陌生人模式 =====
     } else {
 
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
@@ -857,18 +849,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const booking = pendingBooking[userId];
         const title = text;
         delete pendingBooking[userId];
-
         const bookingId = Date.now().toString();
         waitingBookingConfirm[bookingId] = {
           userId, name: booking.name, relation: booking.relation,
           timeStr: booking.timeStr, title,
         };
-
         const { date, hasTime } = parseEventTime(booking.timeStr);
         const timeDisplay = hasTime
           ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -882,7 +871,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 預約申請已送出！\n\n📅 ${timeDisplay}\n📌 ${title}\n\n大衛確認後會通知您，請稍候！` }],
@@ -951,10 +939,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       }
     }
   }
-});
-
-app.get('/', (req, res) => {
-  res.send('David AI Bot is running! 🚀');
 });
 
 const PORT = process.env.PORT || 3000;
