@@ -6,6 +6,12 @@ const https = require('https');
 
 const app = express();
 
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -22,6 +28,7 @@ const anthropic = new Anthropic({
 const DAVID_USER_ID = process.env.DAVID_USER_ID || '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID || '';
 const CALENDAR_ID = process.env.CALENDAR_ID || '';
+const NEWS_API_KEY = process.env.NEWS_API_KEY || '';
 
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
@@ -230,6 +237,7 @@ async function downloadImageAsBase64(messageId) {
   });
 }
 
+// ===== 記憶體資料 =====
 const groupMessages = {};
 const groupNames = {};
 const pendingTasks = [];
@@ -243,6 +251,7 @@ const waitingBookingConfirm = {};
 
 loadContacts().then(data => { contacts = data; });
 
+// ===== 品牌 Prompts =====
 const BRAND_PROMPTS = {
   df: `你是大衛的 AI 助理，請根據提供的內容，產出【DF-OFFROAD】越野吉普車品牌的 IG 文章草稿。風格：賣態度、賣夢想、讓人想加入這個圈子。請包含內文和 3-5 個 hashtag。`,
   david: `你是大衛的 AI 助理，請根據提供的內容，產出【個人品牌 @davidcheng_lifestyle】的 IG 文章草稿。風格：像跟朋友說真心話，真實不裝。請包含內文和 3-5 個 hashtag。`,
@@ -264,6 +273,35 @@ const BRAND_MAP = {
   '全部': 'all', 'all': 'all'
 };
 
+// ===== 新聞 API =====
+app.get('/api/news', async (req, res) => {
+  try {
+    const query = encodeURIComponent('台灣 財經 國際 科技 商業 經濟');
+    const url = `https://newsapi.org/v2/everything?q=${query}&language=zh&sortBy=publishedAt&pageSize=8&apiKey=${NEWS_API_KEY}`;
+    https.get(url, (response) => {
+      let data = '';
+      response.on('data', chunk => data += chunk);
+      response.on('end', () => {
+        try { res.json(JSON.parse(data)); }
+        catch(e) { res.status(500).json({ error: 'Parse error' }); }
+      });
+    }).on('error', (e) => res.status(500).json({ error: e.message }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 行事曆 API =====
+app.get('/api/calendar', async (req, res) => {
+  try {
+    const events = await getCalendarEvents('今天');
+    res.json({ events });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Webhook =====
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
   const events = req.body.events;
@@ -300,7 +338,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       });
       if (groupMessages[groupId].length > 200) groupMessages[groupId] = groupMessages[groupId].slice(-200);
 
-      // 登記群組名稱（支援任何 tag 方式）
       if (text.includes('登記')) {
         const nameMatch = text.match(/登記\s*(.+)/);
         const groupName = nameMatch ? nameMatch[1].trim() : '未命名群組';
@@ -310,7 +347,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」\n\n大衛現在可以用「群組摘要 ${groupName}」查詢這個群組！` }],
         });
 
-      // 摘要（支援任何 tag 方式）
       } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
         const today2 = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
@@ -327,7 +363,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
         });
 
-      // 取消申請（支援任何 tag 方式）
       } else if (text.includes('取消') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -355,7 +390,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
         });
 
-      // 留言（支援任何 tag 方式）
       } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
