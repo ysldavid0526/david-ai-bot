@@ -10,8 +10,11 @@ const app = express();
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   next();
 });
+
+app.use(express.json());
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -137,6 +140,14 @@ function parseEventTime(timeStr) {
     date.setDate(date.getDate() + 1);
   } else if (timeStr.includes('後天')) {
     date.setDate(date.getDate() + 2);
+  } else if (timeStr.includes('下週一')) {
+    date.setDate(date.getDate() + (8 - date.getDay()) % 7 || 7);
+  } else if (timeStr.includes('下週三')) {
+    const d = (10 - date.getDay()) % 7 || 7;
+    date.setDate(date.getDate() + d);
+  } else if (timeStr.includes('下週五')) {
+    const d = (12 - date.getDay()) % 7 || 7;
+    date.setDate(date.getDate() + d);
   }
 
   const timeMatch = timeStr.match(/(上午|下午|早上|晚上)?(\d{1,2})[點:時](\d{0,2})?/);
@@ -249,14 +260,11 @@ const lastDraft = {};
 const pendingReply = {};
 const pendingBooking = {};
 const waitingBookingConfirm = {};
-
-// ===== App 資料（真實 LINE 資料）=====
-const appNotifications = []; // 最新通知
-const appMessages = {};      // 訊息清單 userId -> { name, lastMsg, time, unread }
+const appNotifications = [];
+const appMessages = {};
 
 loadContacts().then(data => { contacts = data; });
 
-// ===== 品牌 Prompts =====
 const BRAND_PROMPTS = {
   df: `你是大衛的 AI 助理，請根據提供的內容，產出【DF-OFFROAD】越野吉普車品牌的 IG 文章草稿。風格：賣態度、賣夢想、讓人想加入這個圈子。請包含內文和 3-5 個 hashtag。`,
   david: `你是大衛的 AI 助理，請根據提供的內容，產出【個人品牌 @davidcheng_lifestyle】的 IG 文章草稿。風格：像跟朋友說真心話，真實不裝。請包含內文和 3-5 個 hashtag。`,
@@ -279,13 +287,9 @@ const BRAND_MAP = {
 };
 
 // ===== API 路由 =====
-app.get('/', (req, res) => {
-  res.send('David AI Bot is running! 🚀');
-});
+app.get('/', (req, res) => res.send('David AI Bot is running! 🚀'));
 
-app.get('/app', (req, res) => {
-  res.sendFile(path.join(__dirname, 'app.html'));
-});
+app.get('/app', (req, res) => res.sendFile(path.join(__dirname, 'app.html')));
 
 app.get('/api/news', async (req, res) => {
   try {
@@ -313,12 +317,10 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-// 真實通知 API
 app.get('/api/notifications', (req, res) => {
   res.json({ notifications: appNotifications.slice(0, 10) });
 });
 
-// 真實訊息 API
 app.get('/api/messages', (req, res) => {
   const list = Object.values(appMessages)
     .sort((a, b) => b.timestamp - a.timestamp)
@@ -326,7 +328,6 @@ app.get('/api/messages', (req, res) => {
   res.json({ messages: list });
 });
 
-// 真實待辦 API
 app.get('/api/todos', (req, res) => {
   const todos = pendingTasks.map(t => ({
     time: t.time,
@@ -335,6 +336,51 @@ app.get('/api/todos', (req, res) => {
     userId: t.userId,
   }));
   res.json({ todos });
+});
+
+// 新增行程 API（App 直接呼叫）
+app.post('/api/add-event', async (req, res) => {
+  try {
+    const { title, timeStr } = req.body;
+    if (!title || !timeStr) return res.status(400).json({ error: '缺少參數' });
+    const result = await addCalendarEvent(title, timeStr);
+    if (result.success) {
+      const { date, hasTime } = parseEventTime(timeStr);
+      const timeDisplay = hasTime
+        ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
+      // 通知大衛 LINE
+      if (DAVID_USER_ID) {
+        await client.pushMessage({
+          to: DAVID_USER_ID,
+          messages: [{ type: 'text', text: `✅ App 新增行程！\n\n📅 ${timeDisplay}\n📌 ${title}` }],
+        });
+      }
+      appNotifications.unshift({ type: 'calendar', icon: '📅', app: 'App 行事曆', text: `新增：${title}（${timeDisplay}）`, time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), timestamp: Date.now() });
+      if (appNotifications.length > 50) appNotifications.pop();
+    }
+    res.json({ success: result.success });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 傳訊息 API（App 直接呼叫）
+app.post('/api/send-message', async (req, res) => {
+  try {
+    const { targetUserId, message } = req.body;
+    if (!targetUserId || !message) return res.status(400).json({ error: '缺少參數' });
+    await client.pushMessage({
+      to: targetUserId,
+      messages: [{ type: 'text', text: message }],
+    });
+    const targetName = contacts[targetUserId] ? contacts[targetUserId].name : targetUserId.slice(-6);
+    appNotifications.unshift({ type: 'sent', icon: '📤', app: 'App 訊息', text: `已傳送給 ${targetName}：${message.slice(0, 30)}`, time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), timestamp: Date.now() });
+    if (appNotifications.length > 50) appNotifications.pop();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== Webhook =====
@@ -377,10 +423,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const nameMatch = text.match(/登記\s*(.+)/);
         const groupName = nameMatch ? nameMatch[1].trim() : '未命名群組';
         groupNames[groupId] = groupName;
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」` }] });
+
       } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
         const today2 = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
@@ -392,10 +436,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           max_tokens: 800,
           messages: [{ role: 'user', content: `請整理以下群組訊息的重點，條列式，並標示有哪些事情需要大衛處理：\n\n${msgText}` }],
         });
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }] });
+
       } else if (text.includes('取消') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -403,11 +445,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const reason = reasonMatch ? reasonMatch[1].trim() : '未說明';
         const eventInfo = content.replace(/原因[：:].+/, '').trim();
         const cancelId = Date.now().toString();
-
-        // 加入通知
         appNotifications.unshift({ type: 'cancel', icon: '🚨', app: '群組申請', text: `${senderName} 申請取消：${eventInfo}`, time: now, timestamp: Date.now() });
         if (appNotifications.length > 50) appNotifications.pop();
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -421,17 +460,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已通知大衛！等待確認中...` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已通知大衛！等待確認中...` }] });
+
       } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
-
         appNotifications.unshift({ type: 'message', icon: '💬', app: '群組留言', text: `${senderName}：${content}`, time: now, timestamp: Date.now() });
         if (appNotifications.length > 50) appNotifications.pop();
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -445,10 +480,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已轉達給大衛！` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已轉達給大衛！` }] });
       }
 
     } else if (isDavid) {
@@ -458,10 +490,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const foundGroupId = Object.entries(groupNames).find(([, name]) => name.includes(groupNameQuery))?.[0];
         if (!foundGroupId) {
           const groupList = Object.values(groupNames).join('、');
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記：${groupList || '尚無'}` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記：${groupList || '尚無'}` }] });
         } else {
           const msgs = groupMessages[foundGroupId] || [];
           if (msgs.length === 0) {
@@ -477,10 +506,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               max_tokens: 1000,
               messages: [{ role: 'user', content: `以下是「${groupNameQuery}」群組${label}的訊息，請幫大衛整理：\n1. 發生什麼事\n2. 需要大衛處理的\n3. 重要決定\n\n${msgText}` }],
             });
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `📋 「${groupNameQuery}」${label}摘要\n\n${response.content[0].text}` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `📋 「${groupNameQuery}」${label}摘要\n\n${response.content[0].text}` }] });
           }
         }
 
@@ -794,7 +820,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要 / 取消 / 留言\n\n📱 App\nhttps://david-ai-bot.onrender.com/app` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令\n登記 群組名稱\n摘要 / 取消 / 留言\n\n📱 App\nhttps://david-ai-bot.onrender.com/app` }],
         });
 
       } else {
@@ -803,17 +829,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
     } else {
 
-      // 記錄訊息到 App
-      const senderName = contacts[userId] ? contacts[userId].name : null;
-
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
         const timeStr = extractTimeStr(text);
         pendingBooking[userId].timeStr = timeStr;
         pendingBooking[userId].step = 'waiting_title';
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `收到時間：${timeStr} ✅\n\n請問這次預約的事由是？` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `收到時間：${timeStr} ✅\n\n請問這次預約的事由是？` }] });
 
       } else if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_title') {
         const booking = pendingBooking[userId];
@@ -825,11 +845,8 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const timeDisplay = hasTime
           ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-
-        // 加入通知
         appNotifications.unshift({ type: 'booking', icon: '📅', app: '大衛 AI Bot', text: `${booking.name} 申請預約 ${timeDisplay}，${title}`, time: now, timestamp: Date.now() });
         if (appNotifications.length > 50) appNotifications.pop();
-
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
@@ -843,10 +860,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
           }],
         });
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 預約申請已送出！\n\n📅 ${timeDisplay}\n📌 ${title}\n\n大衛確認後會通知您！` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 預約申請已送出！\n\n📅 ${timeDisplay}\n📌 ${title}\n\n大衛確認後會通知您！` }] });
 
       } else if (text === '預約') {
         const contact = contacts[userId];
@@ -865,12 +879,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         contacts[userId] = { name, relation };
         delete waitingForName[userId];
         await saveContact(userId, name, relation);
-
-        // 加入通知 & 訊息
         appNotifications.unshift({ type: 'new_contact', icon: '👤', app: '大衛 AI Bot', text: `新聯絡人：${name}（${relation}）`, time: now, timestamp: Date.now() });
         if (appNotifications.length > 50) appNotifications.pop();
         appMessages[userId] = { userId, name, lastMsg: `登記：${relation}`, time: now, timestamp: Date.now(), unread: true };
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
@@ -893,12 +904,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else {
         const name = contacts[userId].name;
         pendingTasks.push({ time: new Date().toLocaleTimeString('zh-TW'), userId, text });
-
-        // 加入通知 & 訊息
         appNotifications.unshift({ type: 'message', icon: '📨', app: '大衛 AI Bot', text: `${name}：${text}`, time: now, timestamp: Date.now() });
         if (appNotifications.length > 50) appNotifications.pop();
         appMessages[userId] = { userId, name, lastMsg: text, time: now, timestamp: Date.now(), unread: true };
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
