@@ -21,15 +21,23 @@ const anthropic = new Anthropic({
 
 const DAVID_USER_ID = process.env.DAVID_USER_ID || '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID || '';
+const CALENDAR_ID = process.env.CALENDAR_ID || '';
+
+// ===== Google Auth =====
+function getGoogleAuth() {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  return new google.auth.GoogleAuth({
+    credentials,
+    scopes: [
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/calendar',
+    ],
+  });
+}
 
 // ===== Google Sheets =====
 function getSheetClient() {
-  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  return google.sheets({ version: 'v4', auth });
+  return google.sheets({ version: 'v4', auth: getGoogleAuth() });
 }
 
 async function loadContacts() {
@@ -67,11 +75,8 @@ async function saveContact(userId, name, relation) {
       spreadsheetId: SPREADSHEET_ID,
       range: '工作表1!A:E',
       valueInputOption: 'RAW',
-      requestBody: {
-        values: [[userId, name, relation, '', joinTime]],
-      },
+      requestBody: { values: [[userId, name, relation, '', joinTime]] },
     });
-    console.log(`✅ 已儲存聯絡人：${name}`);
   } catch (e) {
     console.error('儲存聯絡人失敗:', e.message);
   }
@@ -103,23 +108,140 @@ async function updateNote(userId, note) {
   }
 }
 
+// ===== Google Calendar =====
+function getCalendarClient() {
+  return google.calendar({ version: 'v3', auth: getGoogleAuth() });
+}
+
+// 解析時間文字
+function parseEventTime(timeStr) {
+  const now = new Date();
+  const taipei = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+
+  let date = new Date(taipei);
+  let hasTime = false;
+
+  // 今天/明天/後天
+  if (timeStr.includes('今天') || timeStr.includes('今日')) {
+    // 維持今天
+  } else if (timeStr.includes('明天') || timeStr.includes('明日')) {
+    date.setDate(date.getDate() + 1);
+  } else if (timeStr.includes('後天')) {
+    date.setDate(date.getDate() + 2);
+  }
+
+  // 上午/下午/晚上 + 時間
+  const timeMatch = timeStr.match(/(上午|下午|早上|晚上)?(\d{1,2})[點:時](\d{0,2})?/);
+  if (timeMatch) {
+    hasTime = true;
+    let hour = parseInt(timeMatch[2]);
+    const minute = timeMatch[3] ? parseInt(timeMatch[3]) : 0;
+    const period = timeMatch[1];
+    if ((period === '下午' || period === '晚上') && hour < 12) hour += 12;
+    if (period === '上午' && hour === 12) hour = 0;
+    date.setHours(hour, minute, 0, 0);
+  }
+
+  return { date, hasTime };
+}
+
+// 新增行程
+async function addCalendarEvent(title, timeStr, duration = 60) {
+  try {
+    const calendar = getCalendarClient();
+    const { date, hasTime } = parseEventTime(timeStr);
+
+    let event;
+    if (hasTime) {
+      const endDate = new Date(date.getTime() + duration * 60000);
+      event = {
+        summary: title,
+        start: { dateTime: date.toISOString(), timeZone: 'Asia/Taipei' },
+        end: { dateTime: endDate.toISOString(), timeZone: 'Asia/Taipei' },
+      };
+    } else {
+      const dateStr = date.toISOString().split('T')[0];
+      event = {
+        summary: title,
+        start: { date: dateStr },
+        end: { date: dateStr },
+      };
+    }
+
+    const res = await calendar.events.insert({
+      calendarId: CALENDAR_ID,
+      requestBody: event,
+    });
+
+    return { success: true, event: res.data };
+  } catch (e) {
+    console.error('新增行程失敗:', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+// 查詢行程
+async function getCalendarEvents(dateStr) {
+  try {
+    const calendar = getCalendarClient();
+    const taipei = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+
+    let targetDate = new Date(taipei);
+    if (dateStr === '明天') targetDate.setDate(targetDate.getDate() + 1);
+    else if (dateStr === '後天') targetDate.setDate(targetDate.getDate() + 2);
+    else if (dateStr === '本週') {
+      const day = targetDate.getDay();
+      targetDate.setDate(targetDate.getDate() - day + 1);
+    }
+
+    targetDate.setHours(0, 0, 0, 0);
+    const endDate = new Date(targetDate);
+
+    if (dateStr === '本週') {
+      endDate.setDate(endDate.getDate() + 7);
+    } else {
+      endDate.setDate(endDate.getDate() + 1);
+    }
+
+    const res = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: targetDate.toISOString(),
+      timeMax: endDate.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+      timeZone: 'Asia/Taipei',
+    });
+
+    return res.data.items || [];
+  } catch (e) {
+    console.error('查詢行程失敗:', e.message);
+    return [];
+  }
+}
+
+function formatEvents(events, label) {
+  if (events.length === 0) return `📅 ${label}沒有行程`;
+  const list = events.map(e => {
+    const start = e.start.dateTime
+      ? new Date(e.start.dateTime).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit' })
+      : '全天';
+    return `• ${start} ${e.summary}`;
+  }).join('\n');
+  return `📅 ${label}行程\n\n${list}`;
+}
+
 // ===== 下載圖片為 base64 =====
 async function downloadImageAsBase64(messageId) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'api-data.line.me',
       path: `/v2/bot/message/${messageId}/content`,
-      headers: {
-        Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-      },
+      headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
     };
     https.get(options, (res) => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => {
-        const buffer = Buffer.concat(chunks);
-        resolve(buffer.toString('base64'));
-      });
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
       res.on('error', reject);
     }).on('error', reject);
   });
@@ -132,7 +254,7 @@ const waitingForName = {};
 let contacts = {};
 const pendingImages = {};
 const lastDraft = {};
-const pendingReply = {}; // 暫存待確認的回覆
+const pendingReply = {};
 
 loadContacts().then(data => { contacts = data; });
 
@@ -171,19 +293,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
     // ===== 處理圖片訊息 =====
     if (event.type === 'message' && event.message.type === 'image' && isDavid) {
-      pendingImages[userId] = {
-        messageId: event.message.id,
-        time: Date.now(),
-      };
+      pendingImages[userId] = { messageId: event.message.id, time: Date.now() };
       await client.replyMessage({
         replyToken: event.replyToken,
-        messages: [{ type: 'text', text: '📸 圖片收到！請傳指令，例如：\n寫文案 df 幫我賣這個產品\n寫文案 viebelle\n寫文案 聖朝\n寫文案 david\n寫文案 全部' }],
+        messages: [{ type: 'text', text: '📸 圖片收到！請傳指令，例如：\n寫文案 df 幫我賣這個產品\n寫文案 viebelle\n寫文案 聖朝' }],
       });
       continue;
     }
 
     if (event.type !== 'message' || event.message.type !== 'text') continue;
-
     const text = event.message.text.trim();
 
     // ===== 群組模式 =====
@@ -193,11 +311,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       groupMessages[groupId].push({
         time: new Date().toLocaleTimeString('zh-TW'),
         sender: contacts[userId] ? contacts[userId].name : userId.slice(-6),
-        text: text,
+        text,
       });
-      if (groupMessages[groupId].length > 100) {
-        groupMessages[groupId] = groupMessages[groupId].slice(-100);
-      }
+      if (groupMessages[groupId].length > 100) groupMessages[groupId] = groupMessages[groupId].slice(-100);
       if (text.includes('@摘要')) {
         const msgs = groupMessages[groupId];
         const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
@@ -215,7 +331,58 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     // ===== 大衛模式 =====
     } else if (isDavid) {
 
-      if (text === '今天待辦' || text === '待辦清單') {
+      // 行程相關
+      if (text.startsWith('新增行程 ') || text.startsWith('新增行程：')) {
+        const input = text.replace(/^新增行程[： ]/, '').trim();
+        // 格式：時間 標題，例如：明天下午3點 工廠會議
+        const match = input.match(/^(.+?)\s+(.+)$/) || input.match(/^(.+)$/);
+        let timeStr, title;
+        if (match && match[2]) {
+          timeStr = match[1];
+          title = match[2];
+        } else {
+          timeStr = '今天';
+          title = input;
+        }
+        const result = await addCalendarEvent(title, timeStr);
+        if (result.success) {
+          const { date, hasTime } = parseEventTime(timeStr);
+          const timeDisplay = hasTime
+            ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+            : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `✅ 已新增行程！\n\n📅 ${timeDisplay}\n📌 ${title}` }],
+          });
+        } else {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 新增失敗，請再試一次。` }],
+          });
+        }
+
+      } else if (text === '今天行程' || text === '今日行程') {
+        const events2 = await getCalendarEvents('今天');
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: formatEvents(events2, '今天') }],
+        });
+
+      } else if (text === '明天行程' || text === '明日行程') {
+        const events2 = await getCalendarEvents('明天');
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: formatEvents(events2, '明天') }],
+        });
+
+      } else if (text === '本週行程' || text === '這週行程') {
+        const events2 = await getCalendarEvents('本週');
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: formatEvents(events2, '本週') }],
+        });
+
+      } else if (text === '今天待辦' || text === '待辦清單') {
         if (pendingTasks.length === 0) {
           await client.replyMessage({
             replyToken: event.replyToken,
@@ -259,7 +426,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         if (!found) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」的聯絡人資料。` }],
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」。` }],
           });
         } else {
           const [, c] = found;
@@ -277,7 +444,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         if (!found) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」，請確認姓名。` }],
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」。` }],
           });
         } else {
           const [foundUserId, c] = found;
@@ -295,11 +462,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const searchName = spaceIdx > -1 ? input.slice(0, spaceIdx) : input;
         const instruction = spaceIdx > -1 ? input.slice(spaceIdx + 1) : '';
         const found = Object.entries(contacts).find(([, c]) => c.name.includes(searchName));
-
         if (!found) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」，請確認姓名。` }],
+            messages: [{ type: 'text', text: `❌ 找不到「${searchName}」。` }],
           });
         } else {
           const [targetUserId, c] = found;
@@ -317,11 +483,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               }],
             });
             const draft = response.content[0].text;
-            pendingReply[userId] = {
-              targetUserId,
-              targetName: c.name,
-              draft,
-            };
+            pendingReply[userId] = { targetUserId, targetName: c.name, draft };
             await client.pushMessage({
               to: userId,
               messages: [{ type: 'text', text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}\n\n---\n傳「確認傳送」送出，或傳「取消」放棄。` }],
@@ -336,7 +498,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         if (!pending) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '❌ 沒有待傳送的回覆，請先用「回覆」指令草擬訊息。' }],
+            messages: [{ type: 'text', text: '❌ 沒有待傳送的回覆。' }],
           });
         } else {
           try {
@@ -397,46 +559,27 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const extraContent = parts.slice(1).join(' ');
         const brandKey = BRAND_MAP[brandRaw] || 'all';
         const prompt = BRAND_PROMPTS[brandKey];
-
         const imgData = pendingImages[userId];
         const hasImage = imgData && (Date.now() - imgData.time < 5 * 60 * 1000);
-
         try {
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: '⏳ 正在幫你產出 IG 草稿，請稍等...' }],
           });
-
           let messages;
           if (hasImage) {
             const base64Image = await downloadImageAsBase64(imgData.messageId);
             delete pendingImages[userId];
-            messages = [{
-              role: 'user',
-              content: [
-                { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-                { type: 'text', text: `${prompt}\n\n請根據這張照片${extraContent ? `和以下補充內容：${extraContent}` : ''}，產出 IG 文案。` }
-              ]
-            }];
+            messages = [{ role: 'user', content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+              { type: 'text', text: `${prompt}\n\n請根據這張照片${extraContent ? `和以下補充內容：${extraContent}` : ''}，產出 IG 文案。` }
+            ]}];
           } else {
-            messages = [{
-              role: 'user',
-              content: `${prompt}\n\n今天的內容：${extraContent || input}`
-            }];
+            messages = [{ role: 'user', content: `${prompt}\n\n今天的內容：${extraContent || input}` }];
           }
-
-          const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5',
-            max_tokens: 1000,
-            messages,
-          });
-
+          const response = await anthropic.messages.create({ model: 'claude-sonnet-4-5', max_tokens: 1000, messages });
           lastDraft[userId] = response.content[0].text;
-
-          await client.pushMessage({
-            to: userId,
-            messages: [{ type: 'text', text: response.content[0].text }],
-          });
+          await client.pushMessage({ to: userId, messages: [{ type: 'text', text: response.content[0].text }] });
         } catch (error) {
           console.error('Error:', error);
         }
@@ -458,16 +601,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 1000,
-              messages: [{
-                role: 'user',
-                content: `以下是原本的 IG 文案：\n\n${previous}\n\n請根據以下要求修改：${instruction || '整體優化'}\n\n請直接給我修改後的完整文案。`
-              }],
+              messages: [{ role: 'user', content: `以下是原本的 IG 文案：\n\n${previous}\n\n請根據以下要求修改：${instruction || '整體優化'}\n\n請直接給我修改後的完整文案。` }],
             });
             lastDraft[userId] = response.content[0].text;
-            await client.pushMessage({
-              to: userId,
-              messages: [{ type: 'text', text: response.content[0].text }],
-            });
+            await client.pushMessage({ to: userId, messages: [{ type: 'text', text: response.content[0].text }] });
           } catch (error) {
             console.error('Error:', error);
           }
@@ -476,7 +613,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n確認傳送\n取消\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n今天行程\n明天行程\n本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n確認傳送 / 取消\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
@@ -494,9 +631,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const relation = parts[1] || '未知';
         contacts[userId] = { name, relation };
         delete waitingForName[userId];
-
         await saveContact(userId, name, relation);
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `謝謝您，${name}！我已幫您登記，大衛會盡快回覆您。` }],
@@ -515,11 +650,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         });
       } else {
         const name = contacts[userId].name;
-        pendingTasks.push({
-          time: new Date().toLocaleTimeString('zh-TW'),
-          userId,
-          text,
-        });
+        pendingTasks.push({ time: new Date().toLocaleTimeString('zh-TW'), userId, text });
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！` }],
