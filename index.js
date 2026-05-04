@@ -399,7 +399,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const isGroup = sourceType === 'group' || sourceType === 'room';
     const isDavid = userId === DAVID_USER_ID;
 
-    if (event.type === 'message' && event.message.type === 'image' && isDavid) {
+    if (event.type === 'message' && event.message.type === 'image' && isDavid && !isGroup) {
       pendingImages[userId] = { messageId: event.message.id, time: Date.now() };
       await client.replyMessage({
         replyToken: event.replyToken,
