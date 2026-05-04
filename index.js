@@ -230,9 +230,8 @@ async function downloadImageAsBase64(messageId) {
   });
 }
 
-// ===== 記憶體資料 =====
 const groupMessages = {};
-const groupNames = {}; // 群組ID → 名稱
+const groupNames = {};
 const pendingTasks = [];
 const waitingForName = {};
 let contacts = {};
@@ -301,9 +300,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       });
       if (groupMessages[groupId].length > 200) groupMessages[groupId] = groupMessages[groupId].slice(-200);
 
-      // @David登記 — 登記群組名稱
-      if (text.includes('@David登記')) {
-        const nameMatch = text.match(/@David登記\s*(.+)/);
+      // 登記群組名稱（支援任何 tag 方式）
+      if (text.includes('登記')) {
+        const nameMatch = text.match(/登記\s*(.+)/);
         const groupName = nameMatch ? nameMatch[1].trim() : '未命名群組';
         groupNames[groupId] = groupName;
         await client.replyMessage({
@@ -311,23 +310,26 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」\n\n大衛現在可以用「群組摘要 ${groupName}」查詢這個群組！` }],
         });
 
-      // @David摘要
-      } else if (text.includes('@David摘要') || text.includes('@摘要')) {
+      // 摘要（支援任何 tag 方式）
+      } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
-        const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
+        const today2 = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
+        const todayMsgs = msgs.filter(m => m.date === today2);
+        const targetMsgs = todayMsgs.length > 0 ? todayMsgs : msgs.slice(-50);
+        const msgText = targetMsgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
         const response = await anthropic.messages.create({
           model: 'claude-sonnet-4-5',
           max_tokens: 800,
-          messages: [{ role: 'user', content: `請整理以下群組訊息的重點，條列式：\n\n${msgText}` }],
+          messages: [{ role: 'user', content: `請整理以下群組訊息的重點，條列式，並標示有哪些事情需要大衛處理：\n\n${msgText}` }],
         });
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
         });
 
-      // @David取消
-      } else if (text.includes('@David取消')) {
-        const content = text.replace(/@David取消\s*/, '').trim();
+      // 取消申請（支援任何 tag 方式）
+      } else if (text.includes('取消') && (text.includes('@') || text.includes('David'))) {
+        const content = text.replace(/.*取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
         const reasonMatch = content.match(/原因[：:]\s*(.+)/);
         const reason = reasonMatch ? reasonMatch[1].trim() : '未說明';
@@ -353,9 +355,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
         });
 
-      // @David留言
-      } else if (text.includes('@David留言')) {
-        const content = text.replace(/@David留言\s*/, '').trim();
+      // 留言（支援任何 tag 方式）
+      } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
+        const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
 
         await client.pushMessage({
@@ -381,21 +383,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     // ===== 大衛模式 =====
     } else if (isDavid) {
 
-      // 群組摘要（私訊查詢）
       if (text.startsWith('群組摘要 ') || text.startsWith('群組摘要：')) {
         const groupNameQuery = text.replace(/^群組摘要[： ]/, '').trim();
-
-        // 找對應的群組ID
-        const foundGroupId = Object.entries(groupNames).find(([, name]) =>
-          name.includes(groupNameQuery)
-        )?.[0];
+        const foundGroupId = Object.entries(groupNames).find(([, name]) => name.includes(groupNameQuery))?.[0];
 
         if (!foundGroupId) {
-          // 列出所有已登記群組
           const groupList = Object.values(groupNames).join('、');
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記的群組：${groupList || '尚無登記的群組'}\n\n請先在群組裡傳「@David登記 群組名稱」` }],
+            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記的群組：${groupList || '尚無登記的群組'}\n\n請先在群組裡傳「登記 群組名稱」` }],
           });
         } else {
           const msgs = groupMessages[foundGroupId] || [];
@@ -405,26 +401,17 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               messages: [{ type: 'text', text: `📋 「${groupNameQuery}」今天還沒有訊息記錄。` }],
             });
           } else {
-            // 只抓今天的訊息
             const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
             const todayMsgs = msgs.filter(m => m.date === today);
             const targetMsgs = todayMsgs.length > 0 ? todayMsgs : msgs.slice(-50);
             const label = todayMsgs.length > 0 ? '今天' : '最近';
-
             const msgText = targetMsgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 1000,
               messages: [{
                 role: 'user',
-                content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：
-
-1. 今天發生了什麼事（重點摘要）
-2. 有哪些事情需要大衛處理或決策
-3. 有沒有重要通知或決定
-
-訊息記錄：
-${msgText}`
+                content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：\n\n1. 今天發生了什麼事（重點摘要）\n2. 有哪些事情需要大衛處理或決策\n3. 有沒有重要通知或決定\n\n訊息記錄：\n${msgText}`
               }],
             });
             await client.replyMessage({
@@ -434,12 +421,11 @@ ${msgText}`
           }
         }
 
-      // 列出所有群組
       } else if (text === '我的群組') {
         if (Object.keys(groupNames).length === 0) {
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '目前還沒有登記任何群組。\n\n請在群組裡傳「@David登記 群組名稱」' }],
+            messages: [{ type: 'text', text: '目前還沒有登記任何群組。\n\n請在群組裡傳「登記 群組名稱」' }],
           });
         } else {
           const list = Object.entries(groupNames).map(([, name]) => `• ${name}`).join('\n');
@@ -449,12 +435,10 @@ ${msgText}`
           });
         }
 
-      // 群組取消確認
       } else if (text.startsWith('群組確認取消_')) {
         const parts = text.split('_');
         const eventInfo = parts[2];
         const groupId = parts[3];
-
         try {
           const calendar = getCalendarClient();
           const taipei = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
@@ -470,18 +454,13 @@ ${msgText}`
             q: eventInfo,
           });
           const evts = res.data.items || [];
-          if (evts.length > 0) {
-            await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
-          }
-        } catch (e) {
-          console.error('刪除行程失敗:', e.message);
-        }
+          if (evts.length > 0) await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
+        } catch (e) { console.error('刪除行程失敗:', e.message); }
 
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已確認取消！行事曆已更新。` }],
         });
-
         await client.pushMessage({
           to: groupId,
           messages: [{ type: 'text', text: `✅ 大衛已確認取消：${eventInfo}` }],
@@ -491,12 +470,10 @@ ${msgText}`
         const parts = text.split('_');
         const groupId = parts[2];
         const senderName = parts[4];
-
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: 'text', text: `✅ 已拒絕取消申請。` }],
         });
-
         await client.pushMessage({
           to: groupId,
           messages: [{ type: 'text', text: `❌ 大衛確認保留此行程，${senderName} 的取消申請不通過。` }],
@@ -612,7 +589,6 @@ ${msgText}`
             });
           }
         } catch (error) {
-          console.error('取消行程失敗:', error);
           await client.replyMessage({
             replyToken: event.replyToken,
             messages: [{ type: 'text', text: `❌ 取消失敗，請再試一次。` }],
@@ -824,7 +800,7 @@ ${msgText}`
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令\n@David登記 群組名稱\n@David摘要\n@David取消 行程 原因：OOO\n@David留言 內容` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要\n取消 行程 原因：OOO\n留言 內容` }],
         });
 
       } else {
