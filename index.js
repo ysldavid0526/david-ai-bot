@@ -250,6 +250,10 @@ const pendingReply = {};
 const pendingBooking = {};
 const waitingBookingConfirm = {};
 
+// ===== App 資料（真實 LINE 資料）=====
+const appNotifications = []; // 最新通知
+const appMessages = {};      // 訊息清單 userId -> { name, lastMsg, time, unread }
+
 loadContacts().then(data => { contacts = data; });
 
 // ===== 品牌 Prompts =====
@@ -309,6 +313,30 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
+// 真實通知 API
+app.get('/api/notifications', (req, res) => {
+  res.json({ notifications: appNotifications.slice(0, 10) });
+});
+
+// 真實訊息 API
+app.get('/api/messages', (req, res) => {
+  const list = Object.values(appMessages)
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 20);
+  res.json({ messages: list });
+});
+
+// 真實待辦 API
+app.get('/api/todos', (req, res) => {
+  const todos = pendingTasks.map(t => ({
+    time: t.time,
+    name: contacts[t.userId] ? contacts[t.userId].name : `陌生人(${t.userId.slice(-6)})`,
+    text: t.text,
+    userId: t.userId,
+  }));
+  res.json({ todos });
+});
+
 // ===== Webhook =====
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
@@ -331,6 +359,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
     if (event.type !== 'message' || event.message.type !== 'text') continue;
     const text = event.message.text.trim();
+    const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
 
     if (isGroup) {
       const groupId = event.source.groupId || event.source.roomId;
@@ -350,7 +379,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         groupNames[groupId] = groupName;
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」\n\n大衛現在可以用「群組摘要 ${groupName}」查詢這個群組！` }],
+          messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」` }],
         });
       } else if (text.includes('摘要')) {
         const msgs = groupMessages[groupId];
@@ -374,11 +403,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const reason = reasonMatch ? reasonMatch[1].trim() : '未說明';
         const eventInfo = content.replace(/原因[：:].+/, '').trim();
         const cancelId = Date.now().toString();
+
+        // 加入通知
+        appNotifications.unshift({ type: 'cancel', icon: '🚨', app: '群組申請', text: `${senderName} 申請取消：${eventInfo}`, time: now, timestamp: Date.now() });
+        if (appNotifications.length > 50) appNotifications.pop();
+
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
             type: 'text',
-            text: `🚨 取消申請！\n\n👤 ${senderName} 申請取消行程\n📌 ${eventInfo}\n💬 原因：${reason}\n\n請確認是否取消？`,
+            text: `🚨 取消申請！\n\n👤 ${senderName} 申請取消行程\n📌 ${eventInfo}\n💬 原因：${reason}`,
             quickReply: {
               items: [
                 { type: 'action', action: { type: 'message', label: '✅ 確認取消', text: `群組確認取消_${cancelId}_${eventInfo}_${groupId}_${userId}` } },
@@ -389,16 +423,20 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         });
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
+          messages: [{ type: 'text', text: `✅ 已通知大衛！等待確認中...` }],
         });
       } else if (text.includes('留言') && (text.includes('@') || text.includes('David'))) {
         const content = text.replace(/.*留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
+
+        appNotifications.unshift({ type: 'message', icon: '💬', app: '群組留言', text: `${senderName}：${content}`, time: now, timestamp: Date.now() });
+        if (appNotifications.length > 50) appNotifications.pop();
+
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
             type: 'text',
-            text: `💬 群組留言！\n\n👤 ${senderName} 在群組留言：\n\n${content}`,
+            text: `💬 群組留言！\n\n👤 ${senderName}：\n\n${content}`,
             quickReply: {
               items: [
                 { type: 'action', action: { type: 'message', label: '↩️ 回覆他', text: `回覆 ${senderName} ` } },
@@ -409,7 +447,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         });
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已轉達給大衛！他會盡快回覆。` }],
+          messages: [{ type: 'text', text: `✅ 已轉達給大衛！` }],
         });
       }
 
@@ -422,15 +460,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           const groupList = Object.values(groupNames).join('、');
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記的群組：${groupList || '尚無登記的群組'}\n\n請先在群組裡傳「登記 群組名稱」` }],
+            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記：${groupList || '尚無'}` }],
           });
         } else {
           const msgs = groupMessages[foundGroupId] || [];
           if (msgs.length === 0) {
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `📋 「${groupNameQuery}」今天還沒有訊息記錄。` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `📋 「${groupNameQuery}」今天還沒有訊息。` }] });
           } else {
             const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
             const todayMsgs = msgs.filter(m => m.date === today);
@@ -440,7 +475,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 1000,
-              messages: [{ role: 'user', content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：\n\n1. 今天發生了什麼事（重點摘要）\n2. 有哪些事情需要大衛處理或決策\n3. 有沒有重要通知或決定\n\n訊息記錄：\n${msgText}` }],
+              messages: [{ role: 'user', content: `以下是「${groupNameQuery}」群組${label}的訊息，請幫大衛整理：\n1. 發生什麼事\n2. 需要大衛處理的\n3. 重要決定\n\n${msgText}` }],
             });
             await client.replyMessage({
               replyToken: event.replyToken,
@@ -451,16 +486,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
       } else if (text === '我的群組') {
         if (Object.keys(groupNames).length === 0) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '目前還沒有登記任何群組。\n\n請在群組裡傳「登記 群組名稱」' }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '目前還沒有登記任何群組。' }] });
         } else {
           const list = Object.entries(groupNames).map(([, name]) => `• ${name}`).join('\n');
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `👥 已登記的群組：\n\n${list}\n\n傳「群組摘要 群組名稱」查詢` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `👥 已登記的群組：\n\n${list}` }] });
         }
 
       } else if (text.startsWith('群組確認取消_')) {
@@ -473,53 +502,28 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           taipei.setHours(0, 0, 0, 0);
           const endDate = new Date(taipei);
           endDate.setDate(endDate.getDate() + 30);
-          const res = await calendar.events.list({
-            calendarId: CALENDAR_ID,
-            timeMin: taipei.toISOString(),
-            timeMax: endDate.toISOString(),
-            singleEvents: true,
-            orderBy: 'startTime',
-            q: eventInfo,
-          });
+          const res = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: taipei.toISOString(), timeMax: endDate.toISOString(), singleEvents: true, orderBy: 'startTime', q: eventInfo });
           const evts = res.data.items || [];
           if (evts.length > 0) await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
         } catch (e) { console.error('刪除行程失敗:', e.message); }
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已確認取消！行事曆已更新。` }],
-        });
-        await client.pushMessage({
-          to: groupId,
-          messages: [{ type: 'text', text: `✅ 大衛已確認取消：${eventInfo}` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已確認取消！行事曆已更新。` }] });
+        await client.pushMessage({ to: groupId, messages: [{ type: 'text', text: `✅ 大衛已確認取消：${eventInfo}` }] });
 
       } else if (text.startsWith('群組拒絕取消_')) {
         const parts = text.split('_');
         const groupId = parts[2];
         const senderName = parts[4];
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已拒絕取消申請。` }],
-        });
-        await client.pushMessage({
-          to: groupId,
-          messages: [{ type: 'text', text: `❌ 大衛確認保留此行程，${senderName} 的取消申請不通過。` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已拒絕取消申請。` }] });
+        await client.pushMessage({ to: groupId, messages: [{ type: 'text', text: `❌ 大衛確認保留此行程，${senderName} 的取消申請不通過。` }] });
 
       } else if (text === '已讀留言') {
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 已讀取。` }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已讀取。` }] });
 
       } else if (text.startsWith('確認預約_') || text.startsWith('拒絕預約_')) {
         const bookingId = text.split('_')[1];
         const booking = waitingBookingConfirm[bookingId];
         if (!booking) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: '❌ 找不到此預約，可能已過期。' }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '❌ 找不到此預約。' }] });
         } else if (text.startsWith('確認預約_')) {
           const result = await addCalendarEvent(`${booking.name}｜${booking.title}`, booking.timeStr);
           delete waitingBookingConfirm[bookingId];
@@ -528,25 +532,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const timeDisplay = hasTime
               ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
               : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `✅ 已確認並寫入行事曆！\n\n📅 ${timeDisplay}\n👤 ${booking.name}\n📌 ${booking.title}` }],
-            });
-            await client.pushMessage({
-              to: booking.userId,
-              messages: [{ type: 'text', text: `✅ 您好，${booking.name}！\n\n大衛已確認您的預約：\n📅 ${timeDisplay}\n📌 ${booking.title}\n\n期待與您會面！` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已確認並寫入行事曆！\n\n📅 ${timeDisplay}\n👤 ${booking.name}\n📌 ${booking.title}` }] });
+            await client.pushMessage({ to: booking.userId, messages: [{ type: 'text', text: `✅ 您好，${booking.name}！\n\n大衛已確認您的預約：\n📅 ${timeDisplay}\n📌 ${booking.title}\n\n期待與您會面！` }] });
           }
         } else {
           delete waitingBookingConfirm[bookingId];
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `✅ 已拒絕 ${booking.name} 的預約。` }],
-          });
-          await client.pushMessage({
-            to: booking.userId,
-            messages: [{ type: 'text', text: `您好，${booking.name}！\n\n很抱歉，大衛目前無法安排您的預約，請稍後再試或換個時間。謝謝！` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已拒絕 ${booking.name} 的預約。` }] });
+          await client.pushMessage({ to: booking.userId, messages: [{ type: 'text', text: `您好，${booking.name}！\n\n很抱歉，大衛目前無法安排您的預約。謝謝！` }] });
         }
 
       } else if (text.startsWith('新增行程 ') || text.startsWith('新增行程：')) {
@@ -561,15 +553,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           const timeDisplay = hasTime
             ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
             : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `✅ 已新增行程！\n\n📅 ${timeDisplay}\n📌 ${title}` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已新增行程！\n\n📅 ${timeDisplay}\n📌 ${title}` }] });
         } else {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 新增失敗，請再試一次。` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `❌ 新增失敗。` }] });
         }
 
       } else if (text.startsWith('取消行程 ') || text.startsWith('取消行程：')) {
@@ -580,29 +566,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           taipei.setHours(0, 0, 0, 0);
           const endDate = new Date(taipei);
           endDate.setDate(endDate.getDate() + 30);
-          const res = await calendar.events.list({
-            calendarId: CALENDAR_ID,
-            timeMin: taipei.toISOString(),
-            timeMax: endDate.toISOString(),
-            singleEvents: true,
-            orderBy: 'startTime',
-            q: keyword,
-          });
+          const res = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: taipei.toISOString(), timeMax: endDate.toISOString(), singleEvents: true, orderBy: 'startTime', q: keyword });
           const evts = res.data.items || [];
           if (evts.length === 0) {
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `❌ 找不到「${keyword}」相關行程。` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `❌ 找不到「${keyword}」相關行程。` }] });
           } else if (evts.length === 1) {
             await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evts[0].id });
             const start = evts[0].start.dateTime
               ? new Date(evts[0].start.dateTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
               : evts[0].start.date;
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `✅ 已取消行程：\n\n📅 ${start}\n📌 ${evts[0].summary}` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `✅ 已取消行程：\n\n📅 ${start}\n📌 ${evts[0].summary}` }] });
           } else {
             const list = evts.slice(0, 5).map((e, i) => {
               const start = e.start.dateTime
@@ -610,16 +583,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
                 : e.start.date;
               return `${i + 1}. ${start} ${e.summary}`;
             }).join('\n');
-            await client.replyMessage({
-              replyToken: event.replyToken,
-              messages: [{ type: 'text', text: `找到多筆行程，請輸入更精確的關鍵字：\n\n${list}` }],
-            });
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `找到多筆行程：\n\n${list}` }] });
           }
         } catch (error) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `❌ 取消失敗，請再試一次。` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `❌ 取消失敗。` }] });
         }
 
       } else if (text === '今天行程' || text === '今日行程') {
@@ -727,7 +694,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 600,
-              messages: [{ role: 'user', content: `以下是一段回覆草稿：\n\n${pending.draft}\n\n請幫我優化這段文字，讓它更自然流暢、更有溫度，但保留原本的意思。口吻要像大衛本人，不要太正式。直接給我優化後的文字。` }],
+              messages: [{ role: 'user', content: `以下是一段回覆草稿：\n\n${pending.draft}\n\n請幫我優化這段文字，讓它更自然流暢、更有溫度。口吻要像大衛本人，不要太正式。直接給我優化後的文字。` }],
             });
             const optimized = response.content[0].text;
             pendingReply[userId].draft = optimized;
@@ -827,7 +794,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要\n取消 行程 原因：OOO\n留言 內容\n\n📱 App\nhttps://david-ai-bot.onrender.com/app` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令（在群組傳）\n登記 群組名稱\n摘要 / 取消 / 留言\n\n📱 App\nhttps://david-ai-bot.onrender.com/app` }],
         });
 
       } else {
@@ -836,13 +803,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
     } else {
 
+      // 記錄訊息到 App
+      const senderName = contacts[userId] ? contacts[userId].name : null;
+
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
         const timeStr = extractTimeStr(text);
         pendingBooking[userId].timeStr = timeStr;
         pendingBooking[userId].step = 'waiting_title';
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `收到時間：${timeStr} ✅\n\n請問這次預約的事由是？\n例如：產品洽談、工廠參觀、合作討論` }],
+          messages: [{ type: 'text', text: `收到時間：${timeStr} ✅\n\n請問這次預約的事由是？` }],
         });
 
       } else if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_title') {
@@ -850,19 +820,21 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         const title = text;
         delete pendingBooking[userId];
         const bookingId = Date.now().toString();
-        waitingBookingConfirm[bookingId] = {
-          userId, name: booking.name, relation: booking.relation,
-          timeStr: booking.timeStr, title,
-        };
+        waitingBookingConfirm[bookingId] = { userId, name: booking.name, relation: booking.relation, timeStr: booking.timeStr, title };
         const { date, hasTime } = parseEventTime(booking.timeStr);
         const timeDisplay = hasTime
           ? date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
+
+        // 加入通知
+        appNotifications.unshift({ type: 'booking', icon: '📅', app: '大衛 AI Bot', text: `${booking.name} 申請預約 ${timeDisplay}，${title}`, time: now, timestamp: Date.now() });
+        if (appNotifications.length > 50) appNotifications.pop();
+
         await client.pushMessage({
           to: DAVID_USER_ID,
           messages: [{
             type: 'text',
-            text: `📅 有人想預約！\n\n👤 ${booking.name}（${booking.relation}）\n🕐 ${timeDisplay}\n📌 ${title}\n\n請確認是否接受？`,
+            text: `📅 有人想預約！\n\n👤 ${booking.name}（${booking.relation}）\n🕐 ${timeDisplay}\n📌 ${title}`,
             quickReply: {
               items: [
                 { type: 'action', action: { type: 'message', label: '✅ 確認預約', text: `確認預約_${bookingId}` } },
@@ -873,23 +845,17 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         });
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `✅ 預約申請已送出！\n\n📅 ${timeDisplay}\n📌 ${title}\n\n大衛確認後會通知您，請稍候！` }],
+          messages: [{ type: 'text', text: `✅ 預約申請已送出！\n\n📅 ${timeDisplay}\n📌 ${title}\n\n大衛確認後會通知您！` }],
         });
 
       } else if (text === '預約') {
         const contact = contacts[userId];
         if (!contact) {
           waitingForName[userId] = true;
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `您好！請先告訴我您的姓名和關係，才能預約。\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `您好！請先告訴我您的姓名和關係。\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }] });
         } else {
           pendingBooking[userId] = { name: contact.name, relation: contact.relation, step: 'waiting_time' };
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{ type: 'text', text: `您好，${contact.name}！\n\n📅 請問您想預約哪個時間？\n\n例如：\n• 明天下午3點\n• 下週一上午10點\n• 5月10日下午2點` }],
-          });
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `您好，${contact.name}！\n\n📅 請問您想預約哪個時間？\n\n例如：\n• 明天下午3點\n• 下週一上午10點` }] });
         }
 
       } else if (waitingForName[userId]) {
@@ -899,14 +865,18 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         contacts[userId] = { name, relation };
         delete waitingForName[userId];
         await saveContact(userId, name, relation);
+
+        // 加入通知 & 訊息
+        appNotifications.unshift({ type: 'new_contact', icon: '👤', app: '大衛 AI Bot', text: `新聯絡人：${name}（${relation}）`, time: now, timestamp: Date.now() });
+        if (appNotifications.length > 50) appNotifications.pop();
+        appMessages[userId] = { userId, name, lastMsg: `登記：${relation}`, time: now, timestamp: Date.now(), unread: true };
+
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
             text: `謝謝您，${name}！我已幫您登記，大衛會盡快回覆您。\n\n如需預約時間，請傳「預約」。`,
-            quickReply: {
-              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
-            },
+            quickReply: { items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }] },
           }],
         });
         if (DAVID_USER_ID) {
@@ -917,20 +887,24 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         waitingForName[userId] = true;
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `👋 您好！歡迎加入大衛的專屬頻道！\n\n我是大衛的 AI 助理 🤖\n大衛是一位台灣創業家，目前經營：\n\n🏭 品豆豆漿工廠\n🍞 Viebelle與蜜麵包\n🚙 DF-OFFROAD 越野吉普車\n❤️ 聖朝百年慈善\n\n我可以幫您：\n📅 預約與大衛會面\n💬 轉達訊息給大衛\n🔔 等待大衛回覆通知\n\n請問您的姓名是？以及您跟大衛是什麼關係？\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }],
+          messages: [{ type: 'text', text: `👋 您好！歡迎加入大衛的專屬頻道！\n\n我是大衛的 AI 助理 🤖\n\n我可以幫您：\n📅 預約與大衛會面\n💬 轉達訊息給大衛\n\n請問您的姓名是？以及您跟大衛是什麼關係？\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }],
         });
 
       } else {
         const name = contacts[userId].name;
         pendingTasks.push({ time: new Date().toLocaleTimeString('zh-TW'), userId, text });
+
+        // 加入通知 & 訊息
+        appNotifications.unshift({ type: 'message', icon: '📨', app: '大衛 AI Bot', text: `${name}：${text}`, time: now, timestamp: Date.now() });
+        if (appNotifications.length > 50) appNotifications.pop();
+        appMessages[userId] = { userId, name, lastMsg: text, time: now, timestamp: Date.now(), unread: true };
+
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
             text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。\n\n如需預約時間，請傳「預約」。`,
-            quickReply: {
-              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
-            },
+            quickReply: { items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }] },
           }],
         });
         if (DAVID_USER_ID) {
