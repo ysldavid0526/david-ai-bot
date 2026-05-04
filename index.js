@@ -77,7 +77,6 @@ async function saveContact(userId, name, relation) {
   }
 }
 
-// 更新備註
 async function updateNote(userId, note) {
   try {
     const sheets = getSheetClient();
@@ -94,7 +93,6 @@ async function updateNote(userId, note) {
           valueInputOption: 'RAW',
           requestBody: { values: [[note]] },
         });
-        console.log(`✅ 已更新備註：${note}`);
         return true;
       }
     }
@@ -134,6 +132,7 @@ const waitingForName = {};
 let contacts = {};
 const pendingImages = {};
 const lastDraft = {};
+const pendingReply = {}; // 暫存待確認的回覆
 
 loadContacts().then(data => { contacts = data; });
 
@@ -303,7 +302,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             messages: [{ type: 'text', text: `❌ 找不到「${searchName}」，請確認姓名。` }],
           });
         } else {
-          const [, c] = found;
+          const [targetUserId, c] = found;
           try {
             await client.replyMessage({
               replyToken: event.replyToken,
@@ -317,13 +316,59 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
                 content: `你是大衛的秘書。大衛要回覆給 ${c.name}（關係：${c.relation}${c.note ? `，備註：${c.note}` : ''}）。\n\n回覆內容：${instruction}\n\n請幫大衛寫一段自然、得體的回覆訊息，口吻像大衛本人，不要太正式。`
               }],
             });
+            const draft = response.content[0].text;
+            pendingReply[userId] = {
+              targetUserId,
+              targetName: c.name,
+              draft,
+            };
             await client.pushMessage({
               to: userId,
-              messages: [{ type: 'text', text: `📝 給 ${c.name} 的回覆草稿：\n\n${response.content[0].text}` }],
+              messages: [{ type: 'text', text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}\n\n---\n傳「確認傳送」送出，或傳「取消」放棄。` }],
             });
           } catch (error) {
             console.error('Error:', error);
           }
+        }
+
+      } else if (text === '確認傳送') {
+        const pending = pendingReply[userId];
+        if (!pending) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '❌ 沒有待傳送的回覆，請先用「回覆」指令草擬訊息。' }],
+          });
+        } else {
+          try {
+            await client.pushMessage({
+              to: pending.targetUserId,
+              messages: [{ type: 'text', text: pending.draft }],
+            });
+            delete pendingReply[userId];
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `✅ 已成功傳送給 ${pending.targetName}！` }],
+            });
+          } catch (error) {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `❌ 傳送失敗，對方可能尚未加 Bot 為好友。` }],
+            });
+          }
+        }
+
+      } else if (text === '取消') {
+        if (pendingReply[userId]) {
+          delete pendingReply[userId];
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '✅ 已取消傳送。' }],
+          });
+        } else {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '沒有待取消的動作。' }],
+          });
         }
 
       } else if (text.startsWith('秘書：') || text.startsWith('秘書:')) {
@@ -431,7 +476,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n確認傳送\n取消\n\n📋 待辦\n今天待辦\n清空待辦\n\n🤖 秘書\n秘書：[訊息內容]` }],
         });
 
       } else {
