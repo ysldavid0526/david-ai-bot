@@ -230,7 +230,9 @@ async function downloadImageAsBase64(messageId) {
   });
 }
 
+// ===== 記憶體資料 =====
 const groupMessages = {};
+const groupNames = {}; // 群組ID → 名稱
 const pendingTasks = [];
 const waitingForName = {};
 let contacts = {};
@@ -263,25 +265,6 @@ const BRAND_MAP = {
   '全部': 'all', 'all': 'all'
 };
 
-// ===== 歡迎訊息 =====
-const WELCOME_MESSAGE = `👋 您好！我是大衛的專屬 AI 助理 🤖
-
-大衛是一位台灣創業家，目前經營：
-🏭 品豆豆漿工廠
-🍞 Viebelle與蜜麵包
-🚙 DF-OFFROAD 越野吉普車
-❤️ 聖朝百年慈善
-
-我可以幫您：
-📅 預約與大衛會面
-💬 轉達訊息給大衛
-🔔 等待大衛回覆通知
-
-在開始之前，請問您的姓名是？以及您跟大衛是什麼關係？
-
-📝 格式：姓名，關係
-例如：王小明，工廠客戶`;
-
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
   const events = req.body.events;
@@ -291,24 +274,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const userId = event.source.userId;
     const isGroup = sourceType === 'group' || sourceType === 'room';
     const isDavid = userId === DAVID_USER_ID;
-
-    // ===== 加入好友事件 =====
-    if (event.type === 'follow') {
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{
-          type: 'text',
-          text: WELCOME_MESSAGE,
-          quickReply: {
-            items: [
-              { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
-              { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
-            ],
-          },
-        }],
-      });
-      continue;
-    }
 
     if (event.type === 'message' && event.message.type === 'image' && isDavid) {
       pendingImages[userId] = { messageId: event.message.id, time: Date.now() };
@@ -326,14 +291,28 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     if (isGroup) {
       const groupId = event.source.groupId || event.source.roomId;
       if (!groupMessages[groupId]) groupMessages[groupId] = [];
+
+      const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
       groupMessages[groupId].push({
-        time: new Date().toLocaleTimeString('zh-TW'),
+        time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }),
+        date: today,
         sender: contacts[userId] ? contacts[userId].name : userId.slice(-6),
         text,
       });
-      if (groupMessages[groupId].length > 100) groupMessages[groupId] = groupMessages[groupId].slice(-100);
+      if (groupMessages[groupId].length > 200) groupMessages[groupId] = groupMessages[groupId].slice(-200);
 
-      if (text.includes('@David摘要') || text.includes('@摘要')) {
+      // @David登記 — 登記群組名稱
+      if (text.includes('@David登記')) {
+        const nameMatch = text.match(/@David登記\s*(.+)/);
+        const groupName = nameMatch ? nameMatch[1].trim() : '未命名群組';
+        groupNames[groupId] = groupName;
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `✅ 已登記群組名稱：「${groupName}」\n\n大衛現在可以用「群組摘要 ${groupName}」查詢這個群組！` }],
+        });
+
+      // @David摘要
+      } else if (text.includes('@David摘要') || text.includes('@摘要')) {
         const msgs = groupMessages[groupId];
         const msgText = msgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
         const response = await anthropic.messages.create({
@@ -346,6 +325,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: '📋 群組摘要\n\n' + response.content[0].text }],
         });
 
+      // @David取消
       } else if (text.includes('@David取消')) {
         const content = text.replace(/@David取消\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -373,6 +353,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           messages: [{ type: 'text', text: `✅ 已通知大衛！\n\n申請取消：${eventInfo}\n原因：${reason}\n\n等待大衛確認中...` }],
         });
 
+      // @David留言
       } else if (text.includes('@David留言')) {
         const content = text.replace(/@David留言\s*/, '').trim();
         const senderName = contacts[userId] ? contacts[userId].name : userId.slice(-6);
@@ -400,7 +381,76 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     // ===== 大衛模式 =====
     } else if (isDavid) {
 
-      if (text.startsWith('群組確認取消_')) {
+      // 群組摘要（私訊查詢）
+      if (text.startsWith('群組摘要 ') || text.startsWith('群組摘要：')) {
+        const groupNameQuery = text.replace(/^群組摘要[： ]/, '').trim();
+
+        // 找對應的群組ID
+        const foundGroupId = Object.entries(groupNames).find(([, name]) =>
+          name.includes(groupNameQuery)
+        )?.[0];
+
+        if (!foundGroupId) {
+          // 列出所有已登記群組
+          const groupList = Object.values(groupNames).join('、');
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `❌ 找不到「${groupNameQuery}」群組。\n\n已登記的群組：${groupList || '尚無登記的群組'}\n\n請先在群組裡傳「@David登記 群組名稱」` }],
+          });
+        } else {
+          const msgs = groupMessages[foundGroupId] || [];
+          if (msgs.length === 0) {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `📋 「${groupNameQuery}」今天還沒有訊息記錄。` }],
+            });
+          } else {
+            // 只抓今天的訊息
+            const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
+            const todayMsgs = msgs.filter(m => m.date === today);
+            const targetMsgs = todayMsgs.length > 0 ? todayMsgs : msgs.slice(-50);
+            const label = todayMsgs.length > 0 ? '今天' : '最近';
+
+            const msgText = targetMsgs.map(m => `${m.time} ${m.sender}: ${m.text}`).join('\n');
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 1000,
+              messages: [{
+                role: 'user',
+                content: `以下是「${groupNameQuery}」群組${label}的訊息記錄，請幫大衛整理：
+
+1. 今天發生了什麼事（重點摘要）
+2. 有哪些事情需要大衛處理或決策
+3. 有沒有重要通知或決定
+
+訊息記錄：
+${msgText}`
+              }],
+            });
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{ type: 'text', text: `📋 「${groupNameQuery}」${label}摘要\n\n${response.content[0].text}` }],
+            });
+          }
+        }
+
+      // 列出所有群組
+      } else if (text === '我的群組') {
+        if (Object.keys(groupNames).length === 0) {
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: '目前還沒有登記任何群組。\n\n請在群組裡傳「@David登記 群組名稱」' }],
+          });
+        } else {
+          const list = Object.entries(groupNames).map(([, name]) => `• ${name}`).join('\n');
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{ type: 'text', text: `👥 已登記的群組：\n\n${list}\n\n傳「群組摘要 群組名稱」查詢` }],
+          });
+        }
+
+      // 群組取消確認
+      } else if (text.startsWith('群組確認取消_')) {
         const parts = text.split('_');
         const eventInfo = parts[2];
         const groupId = parts[3];
@@ -674,10 +724,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const response = await anthropic.messages.create({
               model: 'claude-sonnet-4-5',
               max_tokens: 600,
-              messages: [{
-                role: 'user',
-                content: `以下是一段回覆草稿：\n\n${pending.draft}\n\n請幫我優化這段文字，讓它更自然流暢、更有溫度，但保留原本的意思。口吻要像大衛本人，不要太正式。直接給我優化後的文字。`
-              }],
+              messages: [{ role: 'user', content: `以下是一段回覆草稿：\n\n${pending.draft}\n\n請幫我優化這段文字，讓它更自然流暢、更有溫度，但保留原本的意思。口吻要像大衛本人，不要太正式。直接給我優化後的文字。` }],
             });
             const optimized = response.content[0].text;
             pendingReply[userId].draft = optimized;
@@ -777,7 +824,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       } else if (text === '指令') {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n👥 群組指令\n@David摘要\n@David取消 行程 原因：OOO\n@David留言 內容` }],
+          messages: [{ type: 'text', text: `📋 大衛 AI 指令清單\n\n👥 群組\n我的群組\n群組摘要 群組名稱\n\n📅 行事曆\n新增行程 明天下午3點 工廠會議\n取消行程 工廠會議\n今天行程 / 明天行程 / 本週行程\n\n✍️ 文案\n寫文案 df [內容]\n寫文案 david [內容]\n寫文案 viebelle [內容]\n寫文案 聖朝 [內容]\n寫文案 全部 [內容]\n\n📸 照片文案\n先傳照片 → 再傳寫文案指令\n\n✏️ 修改文案\n修改 [修改要求]\n\n👤 聯絡人\n聯絡人清單\n查 [姓名]\n備註 [姓名] [備註內容]\n回覆 [姓名] [回覆內容]\n\n📋 待辦\n今天待辦 / 清空待辦\n\n🤖 秘書\n秘書：[訊息內容]\n\n群組指令\n@David登記 群組名稱\n@David摘要\n@David取消 行程 原因：OOO\n@David留言 內容` }],
         });
 
       } else {
@@ -847,14 +894,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           });
         }
 
-      } else if (text === '留言') {
-        const contact = contacts[userId];
-        const name = contact ? contact.name : '訪客';
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `請直接輸入您想留給大衛的訊息，我會幫您轉達 📨` }],
-        });
-
       } else if (waitingForName[userId]) {
         const parts = text.split(/[,，、\s]+/);
         const name = parts[0] || text;
@@ -866,12 +905,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
-            text: `謝謝您，${name}！我已幫您登記 ✅\n\n大衛會盡快回覆您。\n\n您可以：`,
+            text: `謝謝您，${name}！我已幫您登記，大衛會盡快回覆您。\n\n如需預約時間，請傳「預約」。`,
             quickReply: {
-              items: [
-                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
-                { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
-              ],
+              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
             },
           }],
         });
@@ -883,16 +919,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         waitingForName[userId] = true;
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{
-            type: 'text',
-            text: WELCOME_MESSAGE,
-            quickReply: {
-              items: [
-                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
-                { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
-              ],
-            },
-          }],
+          messages: [{ type: 'text', text: `👋 您好！歡迎加入大衛的專屬頻道！\n\n我是大衛的 AI 助理 🤖\n大衛是一位台灣創業家，目前經營：\n\n🏭 品豆豆漿工廠\n🍞 Viebelle與蜜麵包\n🚙 DF-OFFROAD 越野吉普車\n❤️ 聖朝百年慈善\n\n我可以幫您：\n📅 預約與大衛會面\n💬 轉達訊息給大衛\n🔔 等待大衛回覆通知\n\n請問您的姓名是？以及您跟大衛是什麼關係？\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }],
         });
 
       } else {
@@ -902,11 +929,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
-            text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！`,
+            text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。\n\n如需預約時間，請傳「預約」。`,
             quickReply: {
-              items: [
-                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
-              ],
+              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
             },
           }],
         });
