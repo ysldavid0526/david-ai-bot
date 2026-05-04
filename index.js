@@ -110,7 +110,6 @@ async function updateNote(userId, note) {
   }
 }
 
-// ===== 時間解析（只抓時間部分）=====
 function extractTimeStr(input) {
   const match = input.match(/(今天|明天|後天|下週[一二三四五六日]|這週[一二三四五六日]|\d+月\d+日?)?[\s]*(上午|下午|早上|晚上)?[\s]*(\d{1,2})[點:時](\d{0,2})?/);
   if (match) return match[0].trim();
@@ -502,15 +501,49 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             });
             const draft = response.content[0].text;
             pendingReply[userId] = { targetUserId, targetName: c.name, draft };
-            // 用 Quick Reply 按鈕
             await client.pushMessage({
               to: userId,
               messages: [{
                 type: 'text',
-                text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}`,
+                text: `📝 給 ${c.name} 的回覆草稿：\n\n${draft}\n\n請選擇：`,
                 quickReply: {
                   items: [
-                    { type: 'action', action: { type: 'message', label: '✅ 確認傳送', text: '確認傳送' } },
+                    { type: 'action', action: { type: 'message', label: '✅ 直接發送', text: '確認傳送' } },
+                    { type: 'action', action: { type: 'message', label: '✨ 優化一下', text: '優化回覆' } },
+                    { type: 'action', action: { type: 'message', label: '❌ 取消', text: '取消' } },
+                  ],
+                },
+              }],
+            });
+          } catch (error) { console.error('Error:', error); }
+        }
+
+      } else if (text === '優化回覆') {
+        const pending = pendingReply[userId];
+        if (!pending) {
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '❌ 沒有待優化的回覆。' }] });
+        } else {
+          try {
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '⏳ 正在優化回覆...' }] });
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 600,
+              messages: [{
+                role: 'user',
+                content: `以下是一段回覆草稿：\n\n${pending.draft}\n\n請幫我優化這段文字，讓它更自然流暢、更有溫度，但保留原本的意思。口吻要像大衛本人，不要太正式。直接給我優化後的文字。`
+              }],
+            });
+            const optimized = response.content[0].text;
+            pendingReply[userId].draft = optimized;
+            await client.pushMessage({
+              to: userId,
+              messages: [{
+                type: 'text',
+                text: `✨ 優化後的回覆：\n\n${optimized}\n\n請選擇：`,
+                quickReply: {
+                  items: [
+                    { type: 'action', action: { type: 'message', label: '✅ 直接發送', text: '確認傳送' } },
+                    { type: 'action', action: { type: 'message', label: '✨ 再優化', text: '優化回覆' } },
                     { type: 'action', action: { type: 'message', label: '❌ 取消', text: '取消' } },
                   ],
                 },
@@ -609,7 +642,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     } else {
 
       if (pendingBooking[userId] && pendingBooking[userId].step === 'waiting_time') {
-        // 只抓時間部分
         const timeStr = extractTimeStr(text);
         pendingBooking[userId].timeStr = timeStr;
         pendingBooking[userId].step = 'waiting_title';
