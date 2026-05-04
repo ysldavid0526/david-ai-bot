@@ -263,6 +263,25 @@ const BRAND_MAP = {
   '全部': 'all', 'all': 'all'
 };
 
+// ===== 歡迎訊息 =====
+const WELCOME_MESSAGE = `👋 您好！我是大衛的專屬 AI 助理 🤖
+
+大衛是一位台灣創業家，目前經營：
+🏭 品豆豆漿工廠
+🍞 Viebelle與蜜麵包
+🚙 DF-OFFROAD 越野吉普車
+❤️ 聖朝百年慈善
+
+我可以幫您：
+📅 預約與大衛會面
+💬 轉達訊息給大衛
+🔔 等待大衛回覆通知
+
+在開始之前，請問您的姓名是？以及您跟大衛是什麼關係？
+
+📝 格式：姓名，關係
+例如：王小明，工廠客戶`;
+
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.json({ status: 'ok' });
   const events = req.body.events;
@@ -272,6 +291,24 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const userId = event.source.userId;
     const isGroup = sourceType === 'group' || sourceType === 'room';
     const isDavid = userId === DAVID_USER_ID;
+
+    // ===== 加入好友事件 =====
+    if (event.type === 'follow') {
+      await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{
+          type: 'text',
+          text: WELCOME_MESSAGE,
+          quickReply: {
+            items: [
+              { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
+              { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
+            ],
+          },
+        }],
+      });
+      continue;
+    }
 
     if (event.type === 'message' && event.message.type === 'image' && isDavid) {
       pendingImages[userId] = { messageId: event.message.id, time: Date.now() };
@@ -363,7 +400,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     // ===== 大衛模式 =====
     } else if (isDavid) {
 
-      // 群組取消確認
       if (text.startsWith('群組確認取消_')) {
         const parts = text.split('_');
         const eventInfo = parts[2];
@@ -811,6 +847,14 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           });
         }
 
+      } else if (text === '留言') {
+        const contact = contacts[userId];
+        const name = contact ? contact.name : '訪客';
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ type: 'text', text: `請直接輸入您想留給大衛的訊息，我會幫您轉達 📨` }],
+        });
+
       } else if (waitingForName[userId]) {
         const parts = text.split(/[,，、\s]+/);
         const name = parts[0] || text;
@@ -822,9 +866,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
-            text: `謝謝您，${name}！我已幫您登記，大衛會盡快回覆您。\n\n如需預約時間，請傳「預約」。`,
+            text: `謝謝您，${name}！我已幫您登記 ✅\n\n大衛會盡快回覆您。\n\n您可以：`,
             quickReply: {
-              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
+              items: [
+                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
+                { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
+              ],
             },
           }],
         });
@@ -836,7 +883,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         waitingForName[userId] = true;
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: 'text', text: `您好！我是大衛的 AI 助理 🤖\n\n請問您的姓名是？以及您跟大衛是什麼關係？\n\n📝 格式：姓名，關係\n例如：王小明，工廠客戶` }],
+          messages: [{
+            type: 'text',
+            text: WELCOME_MESSAGE,
+            quickReply: {
+              items: [
+                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
+                { type: 'action', action: { type: 'message', label: '💬 留言給大衛', text: '留言' } },
+              ],
+            },
+          }],
         });
 
       } else {
@@ -846,9 +902,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           replyToken: event.replyToken,
           messages: [{
             type: 'text',
-            text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。\n\n如需預約時間，請傳「預約」。`,
+            text: `您好，${name}！大衛目前很忙，我已幫您記錄訊息，他稍後會回覆您。謝謝！`,
             quickReply: {
-              items: [{ type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } }],
+              items: [
+                { type: 'action', action: { type: 'message', label: '📅 預約時間', text: '預約' } },
+              ],
             },
           }],
         });
